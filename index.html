@@ -1,0 +1,417 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<title>KANBAN AGENT</title>
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg:#1a1626; --panel:#241d33; --ink:#e8e0ff; --dim:#8a7fa8; --acc:#5ce1a0; --warn:#ffcc4d; --err:#ff6b81;
+    --edge:#3a3050; --card:#2f2743; --edge2:#4a3d66; --hi:#574a78; --hover:#4a3d66;
+    --log:#1a1626; --logink:#c8bfe0; --errink:#ffb3bd;
+  }
+  :root[data-theme="light"] {
+    --bg:#f4efe4; --panel:#fbf7ee; --ink:#241d33; --dim:#6f6584; --acc:#0f9d63; --warn:#a87400; --err:#c8304a;
+    --edge:#c9bfae; --card:#fffdf8; --edge2:#cfc5b4; --hi:#ffffff; --hover:#e9e2d4;
+    --log:#fffdf8; --logink:#3a3050; --errink:#a3192f;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font-family:'Press Start 2P',monospace; font-size:10px; line-height:1.7;
+         image-rendering:pixelated; }
+  header { display:flex; gap:12px; align-items:center; padding:12px 16px; border-bottom:4px solid var(--edge); flex-wrap:wrap; }
+  h1 { font-size:14px; margin:0; letter-spacing:1px; }
+  .btn { font-family:inherit; font-size:9px; padding:8px 10px; background:var(--edge); color:var(--ink); border:0;
+         box-shadow:inset -3px -3px 0 var(--bg), inset 3px 3px 0 var(--hi); cursor:pointer; }
+  .btn:hover { background:var(--hover); }
+  .btn.on { box-shadow:inset 3px 3px 0 var(--bg), inset -3px -3px 0 var(--hi); }
+  .btn.go { background:#2d7a55; box-shadow:inset -3px -3px 0 var(--bg), inset 3px 3px 0 #5ce1a0; }
+  .btn.approve { background:#7a6a2d; box-shadow:inset -3px -3px 0 var(--bg), inset 3px 3px 0 #ffcc4d; }
+  .btn.del { background:#6b2d3a; }
+  #board { display:grid; grid-template-columns:repeat(5,1fr); gap:10px; padding:16px; align-items:start; }
+  .col { background:var(--panel); border:3px solid var(--edge); min-height:60vh; }
+  .col h2 { font-size:9px; margin:0; padding:8px; background:var(--edge); display:flex; justify-content:space-between; }
+  .col.over { border-color:var(--acc); }
+  .card { background:var(--card); border:2px solid var(--edge2); margin:8px; padding:8px; cursor:grab; }
+  .card.running { border-color:var(--acc); }
+  .card.error { border-color:var(--err); }
+  .card .t { font-size:9px; margin-bottom:6px; word-break:break-word; }
+  .card .m { color:var(--dim); font-size:8px; }
+  .card .row { display:flex; gap:4px; margin-top:6px; flex-wrap:wrap; }
+  .card .row button { padding:4px 6px; font-size:8px; }
+  details { margin-top:6px; }
+  summary { cursor:pointer; color:var(--warn); font-size:8px; }
+  pre { white-space:pre-wrap; word-break:break-word; font-size:8px; color:var(--logink); background:var(--log);
+        border:2px solid var(--edge); padding:6px; max-height:160px; overflow:auto; margin:4px 0 0; }
+  dialog { background:var(--panel); color:var(--ink); border:4px solid var(--edge); padding:16px; width:min(560px,90vw); font-family:inherit; }
+  dialog input, dialog textarea, dialog select { width:100%; background:var(--log); color:var(--ink); border:2px solid var(--edge);
+        font-family:inherit; font-size:9px; padding:6px; margin:4px 0 10px; }
+  dialog textarea { height:120px; resize:vertical; }
+  label { font-size:8px; color:var(--dim); }
+  .empty { color:var(--dim); padding:8px; font-size:8px; }
+.item { display:flex; gap:6px; align-items:center; padding:6px; background:var(--card); border:2px solid var(--edge2); margin-bottom:6px; }
+.item.off { opacity:.45; }
+.item .v { flex:1; font-size:8px; word-break:break-all; }
+.item button { padding:3px 5px; font-size:8px; }
+.card .err { color:var(--err); font-size:8px; margin-top:4px; word-break:break-word; }
+#detail { width:min(760px,94vw); }
+#detail pre { max-height:46vh; }
+.dl-meta { display:grid; grid-template-columns:110px 1fr; gap:2px 8px; font-size:8px; color:var(--dim); margin-bottom:10px; }
+.dl-meta b { color:var(--ink); font-weight:normal; word-break:break-all; }
+.dl-actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }
+#detail .log { white-space:pre-wrap; word-break:break-word; font-size:8px; background:var(--log); border:2px solid var(--edge);
+               padding:8px; max-height:46vh; overflow:auto; margin:0; }
+.card .spin { color:var(--acc); font-size:8px; margin-top:4px; animation:blink 1s steps(2) infinite; }
+@keyframes blink { 50% { opacity:.25; } }
+.card .last { color:var(--logink); font-size:8px; margin-top:4px; white-space:pre-wrap; word-break:break-word; max-height:56px; overflow:hidden; }
+#detail .log.err { border-color:var(--err); color:var(--errink); }
+#d-cancel { background:#6b2d3a; display:none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>&#9632; KANBAN AGENT</h1>
+  <button class="btn go" onclick="openNew()">+ TASK</button>
+  <button class="btn" id="tab-board" onclick="view('board')">BOARD</button>
+  <button class="btn" id="tab-master" onclick="view('master')">MASTER</button>
+  <button class="btn" id="btn-theme" onclick="toggleTheme()" title="ganti tema">TERANG</button>
+  <span class="m" id="hint" style="color:var(--dim);font-size:8px"></span>
+</header>
+<div id="board"></div>
+
+<div id="master" style="display:none;padding:16px;display:none">
+  <div class="master-cols" style="display:grid;grid-template-columns:1fr 1fr;gap:16px;align-items:start">
+    <div class="col" style="min-height:auto">
+      <h2><span>MASTER ROOT</span><span id="root-count"></span></h2>
+      <div style="padding:8px;display:flex;gap:6px">
+        <input id="new-root" placeholder="E:\path\proyek" style="flex:1;background:var(--log);color:var(--ink);border:2px solid var(--edge);font-family:inherit;font-size:8px;padding:6px">
+        <button class="btn go" onclick="addRoot()">+</button>
+      </div>
+      <div id="root-list" style="padding:0 8px 8px"></div>
+    </div>
+    <div class="col" style="min-height:auto">
+      <h2><span>MASTER MODEL</span><span id="model-count"></span></h2>
+      <div style="padding:8px;display:flex;gap:6px">
+        <input id="new-model" placeholder="9router/deepsek" style="flex:1;background:var(--log);color:var(--ink);border:2px solid var(--edge);font-family:inherit;font-size:8px;padding:6px">
+        <button class="btn go" onclick="addModel()">+</button>
+      </div>
+      <div id="model-list" style="padding:0 8px 8px"></div>
+    </div>
+  </div>
+</div>
+
+<dialog id="detail">
+  <h2 id="d-title" style="font-size:10px;margin:0 0 10px;word-break:break-word"></h2>
+  <div class="dl-meta">
+    <span>status</span><b id="d-status"></b>
+    <span>lokasi</span><b id="d-loc"></b>
+    <span>model</span><b id="d-model"></b>
+    <span>agent</span><b id="d-agent"></b>
+    <span>branch</span><b id="d-branch"></b>
+    <span>tanggal mulai</span><b id="d-startdate"></b>
+    <span>mulai</span><b id="d-started"></b>
+    <span>selesai</span><b id="d-ended"></b>
+  </div>
+  <label>prompt</label>
+  <pre id="d-prompt" class="log" style="max-height:14vh"></pre>
+  <label style="display:block;margin-top:8px">diff (ringkas)</label>
+  <pre id="d-diff" class="log" style="max-height:14vh"></pre>
+  <label style="display:block;margin-top:8px">output agent</label>
+  <div class="dl-actions" style="margin-bottom:6px">
+    <button class="btn del" onclick="del(taskId)">HAPUS</button>
+    <button class="btn" id="d-cancel" onclick="cancelRun()">HENTIKAN</button>
+    <button class="btn" onclick="setStatus(taskId,'todo')">KEMBALIKAN KE TODO</button>
+    <button class="btn" onclick="detailDlg.close()">TUTUP</button>
+  </div>
+  <label style="display:block;margin-top:10px">output agent</label>
+  <pre id="d-log" class="log"></pre>
+</dialog>
+
+<dialog id="dlg">
+  <h2 style="font-size:10px;margin:0 0 10px">TASK BARU</h2>
+  <label>root (proyek)</label>
+  <select id="f_root" onchange="loadFolders()"></select>
+  <label>folder (repo di bawah root)</label>
+  <select id="f_folder" onchange="checkRepo()"></select>
+  <div id="repo-box" style="display:none;border:2px solid var(--edge2);padding:8px;margin:4px 0 10px">
+    <div id="repo-note" style="color:var(--warn);font-size:8px;margin-bottom:6px"></div>
+    <label>nama repo github</label>
+    <input id="f_repo" placeholder="bantuin">
+    <label>visibilitas</label>
+    <select id="f_vis"><option value="private">PRIVATE</option><option value="public">PUBLIC</option></select>
+    <button class="btn go" id="btn-repo" onclick="createRepo()">BUAT REPO + PUSH</button>
+  </div>
+  <label>judul</label>
+  <input id="f_title" placeholder="perbaiki login">
+  <label>tanggal mulai</label>
+  <input id="f_start" type="date">
+  <label>prompt ke agent</label>
+  <textarea id="f_prompt" placeholder="jelaskan yang harus dikerjakan..."></textarea>
+  <label>model</label>
+  <select id="f_model"></select>
+  <label>agent</label>
+  <select id="f_agent"><option value="">(default)</option><option value="build">build</option><option value="plan">plan</option></select>
+  <div style="display:flex;gap:8px;margin-top:12px">
+    <button class="btn go" onclick="create()">SIMPAN</button>
+    <button class="btn" onclick="dlg.close()">BATAL</button>
+  </div>
+</dialog>
+
+<script>
+let S = { tasks: [], models: [], cols: [] }, dragId = null;
+const LABEL = { todo: 'TODO', doing: 'PROGRES', review: 'REVIEW', done: 'DONE', error: 'ERROR' };
+const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+async function load() { S = await (await fetch('/api/tasks')).json(); render(); }
+
+function render() {
+  document.getElementById('hint').textContent = S.roots?.length + ' root · ' + S.tasks.length + ' task';
+  const b = document.getElementById('board');
+  b.innerHTML = S.cols.map(c => {
+    const list = S.tasks.filter(t => t.status === c);
+    return `<div class="col" data-col="${c}" ondragover="over(event)" ondragleave="leave(event)" ondrop="drop(event,'${c}')">
+      <h2><span>${LABEL[c]}</span><span>${list.length}</span></h2>
+      ${list.map(card).join('') || '<div class="empty">kosong</div>'}
+    </div>`;
+  }).join('');
+}
+
+function card(t) {
+  const busy = t.status === 'doing';
+  return `<div class="card ${busy ? 'running' : ''} ${t.status === 'error' ? 'error' : ''}" draggable="${!busy}"
+    ondragstart="drag(event,${t.id})" onclick="detail(${t.id})" title="klik untuk detail" id="t${t.id}">
+    <div class="t">${esc(t.title)}</div>
+    <div class="m">${esc(t.folder)} · ${esc(t.model)}</div>
+    ${t.root ? `<div class="m" title="${esc(t.root)}">${esc(t.root.split(/[\\/]/).pop())}/${esc(t.folder)}</div>` : ''}
+    ${t.start_date ? `<div class="m">mulai: ${esc(t.start_date)}</div>` : ''}
+    ${t.branch ? `<div class="m">${esc(t.branch)}</div>` : ''}
+    ${t.status === 'error' && t.output ? `<div class="err">! ${esc(t.output.split('\n')[0].slice(0, 90))}</div>` : ''}
+    ${busy ? `<div class="spin">&#9654; berjalan...</div>
+      <div class="last">${esc((t.output || '').split('\n').filter(Boolean).slice(-3).join('\n') || 'menunggu output agent...')}</div>` : ''}
+    <div class="row" onclick="event.stopPropagation()">
+      ${(t.status === 'todo' || t.status === 'error') ? `<button class="btn go" onclick="run(${t.id})">RUN</button>` : ''}
+      ${t.status === 'review' ? `<button class="btn approve" onclick="setStatus(${t.id},'done')">APPROVE</button>
+                                 <button class="btn" onclick="setStatus(${t.id},'error')">TOLAK</button>` : ''}
+      ${t.status === 'done' ? `<button class="btn" onclick="setStatus(${t.id},'todo')">ULANG</button>` : ''}
+      <button class="btn del" onclick="del(${t.id})">X</button>
+    </div>
+    ${(t.output || t.diff) ? `<details onclick="event.stopPropagation()"><summary>LOG</summary>
+      ${t.diff ? `<pre style="color:#5ce1a0">${esc(t.diff)}</pre>` : ''}
+      <pre>${esc((t.output || '').split('\n').slice(-200).join('\n'))}</pre></details>` : ''}
+  </div>`;
+}
+
+function drag(e, id) { dragId = id; e.dataTransfer.effectAllowed = 'move'; }
+function over(e) { e.preventDefault(); e.currentTarget.classList.add('over'); }
+function leave(e) { e.currentTarget.classList.remove('over'); }
+function drop(e, col) {
+  e.preventDefault(); e.currentTarget.classList.remove('over');
+  if (dragId != null && col !== 'doing') setStatus(dragId, col);
+  dragId = null;
+}
+
+async function setStatus(id, status) {
+  await fetch('/api/tasks/' + id, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status }) });
+  load();
+}
+async function run(id) {
+  const r = await fetch(`/api/tasks/${id}/run`, { method: 'POST' });
+  if (!r.ok) alert((await r.json()).error || 'gagal');
+  load();
+}
+async function del(id) {
+  if (!confirm('hapus task?')) return;
+  const r = await fetch('/api/tasks/' + id, { method: 'DELETE' });
+  if (!r.ok) alert((await r.json()).error);
+  load();
+}
+async function openNew() {
+  const roots = S.roots || [];
+  document.getElementById('f_root').innerHTML = roots.map(r => `<option>${esc(r)}</option>`).join('');
+  await loadFolders();
+  document.getElementById('f_model').innerHTML = S.models.map(m => `<option>${esc(m)}</option>`).join('');
+  document.getElementById('f_title').value = ''; document.getElementById('f_prompt').value = '';
+  document.getElementById('f_start').value = new Date().toISOString().slice(0, 10);
+  dlg.showModal();
+}
+async function loadFolders() {
+  const root = document.getElementById('f_root').value;
+  const folders = await (await fetch('/api/folders?root=' + encodeURIComponent(root))).json();
+  document.getElementById('f_folder').innerHTML = (Array.isArray(folders) ? folders : [])
+    .map(f => `<option>${esc(f)}</option>`).join('') || '<option value="">(kosong)</option>';
+  checkRepo();
+}
+
+async function checkRepo() {
+  const box = document.getElementById('repo-box');
+  const root = f_root.value, folder = f_folder.value;
+  if (!root || !folder) { box.style.display = 'none'; return; }
+  const r = await (await fetch(`/api/repo?root=${encodeURIComponent(root)}&folder=${encodeURIComponent(folder)}`)).json();
+  if (r.error) { box.style.display = 'none'; return; }
+  if (r.hasGit) {
+    box.style.display = 'none';
+  } else {
+    box.style.display = 'block';
+    document.getElementById('repo-note').textContent = 'folder ini belum punya git repo';
+    document.getElementById('f_repo').value = folder;
+  }
+}
+
+async function createRepo() {
+  const name = document.getElementById('f_repo').value.trim();
+  const visibility = document.getElementById('f_vis').value;
+  if (!name) return alert('nama repo wajib');
+  const btn = document.getElementById('btn-repo');
+  btn.disabled = true; btn.textContent = 'PROSES...';
+  try {
+    const r = await fetch('/api/repo', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ root: f_root.value, folder: f_folder.value, name, visibility }),
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || 'gagal');
+    alert('repo dibuat: ' + (j.url || j.out || 'ok'));
+    checkRepo();
+  } catch (e) {
+    alert('gagal: ' + e.message);
+  } finally {
+    btn.disabled = false; btn.textContent = 'BUAT REPO + PUSH';
+  }
+}
+async function create() {
+  const b = {
+    root: f_root.value, folder: f_folder.value, title: f_title.value.trim(), prompt: f_prompt.value.trim(),
+    model: f_model.value, agent: f_agent.value || null, start_date: f_start.value || null,
+  };
+  if (!b.title || !b.prompt || !b.root || !b.folder) return alert('root, folder, judul & prompt wajib');
+  const r = await fetch('/api/tasks', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(b) });
+  if (!r.ok) return alert((await r.json()).error);
+  dlg.close(); load();
+}
+
+load();
+setInterval(() => { if (!dragId && curView === 'board') load(); }, 3000);
+
+// --- tema ---
+function applyTheme(t) {
+  document.documentElement.dataset.theme = t;
+  const b = document.getElementById('btn-theme');
+  if (b) b.textContent = t === 'light' ? 'GELAP' : 'TERANG';
+  try { localStorage.setItem('kanban-theme', t); } catch {}
+}
+function toggleTheme() {
+  applyTheme(document.documentElement.dataset.theme === 'light' ? 'dark' : 'light');
+}
+(function initTheme() {
+  let t = 'dark';
+  try { t = localStorage.getItem('kanban-theme') || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'); } catch {}
+  applyTheme(t);
+})();
+
+// --- view & master ---
+let curView = 'board';
+function view(v) {
+  curView = v;
+  document.getElementById('board').style.display = v === 'board' ? 'grid' : 'none';
+  document.getElementById('master').style.display = v === 'master' ? 'block' : 'none';
+  document.getElementById('tab-board').classList.toggle('on', v === 'board');
+  document.getElementById('tab-master').classList.toggle('on', v === 'master');
+  if (v === 'master') loadMaster();
+  else load();
+}
+
+const api = async (u, opt) => {
+  const r = await fetch(u, opt);
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) { alert(j.error || 'gagal'); throw new Error(j.error || 'gagal'); }
+  return j;
+};
+const sendJson = (u, method, data) => api(u, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
+
+async function loadMaster() {
+  const [roots, models] = await Promise.all([api('/api/roots'), api('/api/models')]);
+  document.getElementById('root-count').textContent = roots.length;
+  document.getElementById('model-count').textContent = models.length;
+  document.getElementById('root-list').innerHTML = roots.map(r => `
+    <div class="item ${r.active ? '' : 'off'}">
+      <span class="v" title="${esc(r.path)}">${esc(r.path)}</span>
+      <button class="btn" onclick="toggle('roots',${r.id},${r.active ? 0 : 1})">${r.active ? 'ON' : 'OFF'}</button>
+      <button class="btn del" onclick="delMaster('roots',${r.id})">X</button>
+    </div>`).join('') || '<div class="empty">belum ada root</div>';
+  document.getElementById('model-list').innerHTML = models.map(m => `
+    <div class="item ${m.active ? '' : 'off'}">
+      <span class="v">${esc(m.name)}</span>
+      <button class="btn" onclick="toggle('models',${m.id},${m.active ? 0 : 1})">${m.active ? 'ON' : 'OFF'}</button>
+      <button class="btn del" onclick="delMaster('models',${m.id})">X</button>
+    </div>`).join('') || '<div class="empty">belum ada model</div>';
+}
+async function addRoot() {
+  const path = document.getElementById('new-root').value.trim();
+  if (!path) return;
+  await sendJson('/api/roots', 'POST', { path });
+  document.getElementById('new-root').value = '';
+  loadMaster();
+}
+async function addModel() {
+  const name = document.getElementById('new-model').value.trim();
+  if (!name) return;
+  await sendJson('/api/models', 'POST', { name });
+  document.getElementById('new-model').value = '';
+  loadMaster();
+}
+const toggle = (t, id, active) => sendJson(`/api/${t}/${id}`, 'PATCH', { active }).then(loadMaster);
+async function delMaster(t, id) {
+  if (!confirm('hapus?')) return;
+  await api(`/api/${t}/${id}`, { method: 'DELETE' }).then(loadMaster);
+}
+
+// --- detail task (klik kartu) ---
+const detailDlg = document.getElementById('detail');
+let taskId = null;
+const fmt = s => s ? new Date(s).toLocaleString('id-ID') : '-';
+
+function detail(id) {
+  const t = S.tasks.find(x => x.id === id);
+  if (!t) return;
+  taskId = id;
+  document.getElementById('d-title').textContent = '#' + t.id + ' ' + t.title;
+  document.getElementById('d-status').textContent = LABEL[t.status] || t.status;
+  document.getElementById('d-status').style.color =
+    t.status === 'error' ? 'var(--err)' : t.status === 'review' ? 'var(--warn)' : t.status === 'done' ? 'var(--acc)' : 'var(--ink)';
+  document.getElementById('d-loc').textContent = (t.root || '?') + '\\' + t.folder;
+  document.getElementById('d-model').textContent = t.model;
+  document.getElementById('d-agent').textContent = t.agent || '(default)';
+  document.getElementById('d-branch').textContent = t.branch || '-';
+  document.getElementById('d-startdate').textContent = t.start_date || '-';
+  document.getElementById('d-started').textContent = fmt(t.started);  document.getElementById('d-ended').textContent = fmt(t.ended);
+  document.getElementById('d-prompt').textContent = t.prompt || '(kosong)';
+  document.getElementById('d-diff').textContent = t.diff || '(tidak ada perubahan file)';
+  const log = document.getElementById('d-log');
+  log.textContent = t.output || (t.status === 'doing' ? 'masih berjalan...' : '(output kosong)');
+  log.classList.toggle('err', t.status === 'error');
+  document.getElementById('d-cancel').style.display = t.status === 'doing' ? 'inline-block' : 'none';
+  detailDlg.showModal();
+  log.scrollTop = log.scrollHeight;
+}
+
+// Dialog detail ikut ter-update kalau task masih jalan.
+setInterval(() => {
+  if (taskId != null && detailDlg.open && S.tasks.some(t => t.id === taskId)) {
+    const t = S.tasks.find(x => x.id === taskId);
+    const log = document.getElementById('d-log');
+    if ((t.output || '') !== log.textContent && !log.classList.contains('err')) {
+      log.textContent = t.output || 'masih berjalan...';
+      log.scrollTop = log.scrollHeight;
+    }
+    document.getElementById('d-status').textContent = LABEL[t.status] || t.status;
+    document.getElementById('d-cancel').style.display = t.status === 'doing' ? 'inline-block' : 'none';
+  }
+}, 1000);
+
+async function cancelRun() {
+  if (!confirm('hentikan agent?')) return;
+  await api(`/api/tasks/${taskId}/cancel`, { method: 'POST' }).catch(() => {});
+  load();
+}
+</script>
+</body>
+</html>
