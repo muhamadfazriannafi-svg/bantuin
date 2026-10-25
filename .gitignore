@@ -4,3 +4,4 @@ tasks.db-shm
 tasks.db-wal
 .probe*
 *.log
+.env

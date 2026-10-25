@@ -32,6 +32,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS root (
   );`);
 // Migrasi ringan untuk DB lama.
 try { db.exec('ALTER TABLE task ADD COLUMN start_date TEXT'); } catch {}
+try { db.exec('ALTER TABLE task ADD COLUMN base_branch TEXT'); } catch {}
 
 // Seed awal cuma kalau tabel kosong. Env ROOTS/WORK_ROOT dipakai sekali di sini.
 const seed = (table, vals) => {
@@ -90,14 +91,40 @@ async function ensureBranch(dir, id) {
   const branch = `task/${id}`;
   const dirty = await git(dir, ['status', '--porcelain']);
   const cur = await git(dir, ['branch', '--show-current']);
-  if (cur === branch) return branch; // sudah di branch task ini
+  // cabang asal dicatat supaya APPROVE tahu harus merge ke mana
+  const base = (cur && cur !== branch) ? cur : (await git(dir, ['rev-parse', '--abbrev-ref', 'HEAD']).catch(() => 'main'));
+  if (cur === branch) return { branch, base };
   if (dirty && dirty !== '') {
     // ponytail: simpan work-in-progress user di stash, bukan ditimpa. Ceiling: tidak auto-pop.
     await git(dir, ['stash', 'push', '-u', '-m', `kanban-${id}-auto`]);
   }
   const exists = await git(dir, ['branch', '--list', branch]).catch(() => '');
   await git(dir, exists ? ['checkout', branch] : ['checkout', '-b', branch]);
-  return branch;
+  return { branch, base };
+}
+
+// APPROVE: merge branch task ke cabang asal, hapus branch task.
+async function mergeTask(t) {
+  const dir = safeDir(t.root, t.folder);
+  const branch = t.branch || `task/${t.id}`;
+  const base = t.base_branch || 'main';
+  const dirty = await git(dir, ['status', '--porcelain']);
+  if (dirty) throw new Error('working tree kotor, commit/stash dulu sebelum approve');
+  await git(dir, ['checkout', base]);
+  await git(dir, ['merge', '--no-ff', '-m', `merge kanban-${t.id}: ${t.title}`, branch]);
+  await git(dir, ['branch', '-d', branch]).catch(() => {}); // gagal diam-diam kalau belum ter-merge
+  return base;
+}
+
+// TOLAK: balik ke cabang asal, buang branch task.
+async function discardTask(t) {
+  const dir = safeDir(t.root, t.folder);
+  const branch = t.branch || `task/${t.id}`;
+  const base = t.base_branch || 'main';
+  const cur = await git(dir, ['branch', '--show-current']);
+  if (cur === branch) await git(dir, ['checkout', base]);
+  await git(dir, ['branch', '-D', branch]).catch(() => {});
+  return base;
 }
 
 function runTask(t) {
@@ -105,11 +132,11 @@ function runTask(t) {
   running.add(t.id);
   q.upd(t.id, { status: 'doing', output: '', diff: '', started: new Date().toISOString() });
   (async () => {
-    let dir, branch;
+    let dir, branch, base;
     try {
       dir = safeDir(t.root, t.folder);
-      branch = await ensureBranch(dir, t.id);
-      q.upd(t.id, { branch });
+      ({ branch, base } = await ensureBranch(dir, t.id));
+      q.upd(t.id, { branch, base_branch: base });
     } catch (e) {
       q.upd(t.id, { status: 'error', output: 'pre-run: ' + e.message, ended: new Date().toISOString() });
       running.delete(t.id); return;
@@ -181,10 +208,10 @@ function runTask(t) {
         ? `EXIT ${spawnErr.code ?? '?'}\n${spawnErr.message}\n\n(agent tidak mengeluarkan output)`
         : `EXIT ${code ?? signal}\n(agent tidak mengeluarkan output)`;
       else if (code !== 0) output += `\n\n[exit ${code ?? signal}]`;
-      // verifikasi nyata: ada diff di branch ini?
-      const diff = await git(dir, ['diff', '--stat', `${branch}@{u}`]).catch(async () => {
-        const base = await git(dir, ['rev-parse', 'HEAD']).catch(() => '');
-        return base ? await git(dir, ['diff', '--stat', `${base}...HEAD`]).catch(() => '') : '';
+      // verifikasi nyata: file apa yang berubah dibanding cabang asal
+      const diff = await git(dir, ['diff', '--stat', `${base}...${branch}`]).catch(async () => {
+        const head = await git(dir, ['rev-parse', 'HEAD']).catch(() => '');
+        return head ? await git(dir, ['diff', '--stat', `${base}...HEAD`]).catch(() => '') : '';
       }).catch(() => '');
       const cancelled = signal === 'SIGTERM' && procs.get(t.id) === child && cancelledIds.has(t.id);
       const ok = code === 0 && !spawnErr && !cancelled;
@@ -206,7 +233,7 @@ const body = req => new Promise(r => { let b = ''; req.on('data', c => b += c); 
 
 http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
-  const m = url.pathname.match(/^\/api\/tasks\/(\d+)(\/run|\/cancel)?$/);
+  const m = url.pathname.match(/^\/api\/tasks\/(\d+)(\/run|\/cancel|\/approve|\/reject)?$/);
   const mm = url.pathname.match(/^\/api\/(roots|models)\/(\d+)$/);
 
   if (url.pathname === '/' || url.pathname === '/index.html') {
@@ -338,6 +365,25 @@ http.createServer(async (req, res) => {
     q.upd(+m[1], patch);
     return json(res, 200, q.get(+m[1]));
   }
+  if (m && (m[2] === '/approve' || m[2] === '/reject') && req.method === 'POST') {
+    const t = q.get(+m[1]);
+    if (!t) return json(res, 404, { error: 'tidak ada' });
+    if (running.has(t.id)) return json(res, 409, { error: 'task masih jalan' });
+    try {
+      if (m[2] === '/approve') {
+        const base = await mergeTask(t);
+        q.upd(t.id, { status: 'done', base_branch: base, ended: new Date().toISOString(),
+          output: (t.output || '') + `\n\n[diapprove: branch ${t.branch || 'task/' + t.id} di-merge ke ${base}]` });
+      } else {
+        const base = await discardTask(t);
+        q.upd(t.id, { status: 'error', base_branch: base,
+          output: (t.output || '') + `\n\n[ditolak: branch ${t.branch || 'task/' + t.id} dihapus, kembali ke ${base}]` });
+      }
+      return json(res, 200, q.get(t.id));
+    } catch (e) {
+      return json(res, 500, { error: e.message });
+    }
+  }
   if (m && m[2] === '/cancel' && req.method === 'POST') {
     const child = procs.get(+m[1]);
     if (!child) return json(res, 409, { error: 'tidak sedang jalan' });
@@ -361,3 +407,4 @@ http.createServer(async (req, res) => {
   }
   res.writeHead(404); res.end('not found');
 }).listen(PORT, () => console.log(`kanban: http://localhost:${PORT}  db=tasks.db  roots=${q.roots().length}  models=${q.models().length}  max_run=${MAX_RUN}`));
+

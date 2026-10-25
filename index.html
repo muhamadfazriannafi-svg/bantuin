@@ -189,8 +189,8 @@ function card(t) {
       <div class="last">${esc((t.output || '').split('\n').filter(Boolean).slice(-3).join('\n') || 'menunggu output agent...')}</div>` : ''}
     <div class="row" onclick="event.stopPropagation()">
       ${(t.status === 'todo' || t.status === 'error') ? `<button class="btn go" onclick="run(${t.id})">RUN</button>` : ''}
-      ${t.status === 'review' ? `<button class="btn approve" onclick="setStatus(${t.id},'done')">APPROVE</button>
-                                 <button class="btn" onclick="setStatus(${t.id},'error')">TOLAK</button>` : ''}
+      ${t.status === 'review' ? `<button class="btn approve" onclick="approve(${t.id})">APPROVE</button>
+                                 <button class="btn" onclick="reject(${t.id})">TOLAK</button>` : ''}
       ${t.status === 'done' ? `<button class="btn" onclick="setStatus(${t.id},'todo')">ULANG</button>` : ''}
       <button class="btn del" onclick="del(${t.id})">X</button>
     </div>
@@ -211,6 +211,27 @@ function drop(e, col) {
 
 async function setStatus(id, status) {
   await fetch('/api/tasks/' + id, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status }) });
+  load();
+}
+
+async function approve(id) {
+  const t = S.tasks.find(x => x.id === id);
+  const branch = t?.branch || `task/${id}`;
+  const base = t?.base_branch || 'main';
+  if (!confirm(`Merge ${branch} ke ${base}?\n\nBranch task akan dihapus setelah merge.`)) return;
+  const r = await fetch(`/api/tasks/${id}/approve`, { method: 'POST' });
+  const j = await r.json();
+  if (!r.ok) { alert('gagal merge: ' + j.error); return; }
+  load();
+}
+
+async function reject(id) {
+  const t = S.tasks.find(x => x.id === id);
+  const branch = t?.branch || `task/${id}`;
+  if (!confirm(`Tolak task?\n\nBranch ${branch} akan DIHAPUS. Perubahan hilang permanen.`)) return;
+  const r = await fetch(`/api/tasks/${id}/reject`, { method: 'POST' });
+  const j = await r.json();
+  if (!r.ok) { alert('gagal: ' + j.error); return; }
   load();
 }
 async function run(id) {
