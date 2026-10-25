@@ -515,6 +515,12 @@ http.createServer(async (req, res) => {
     const b = await body(req);
     const target = String(b.target || t.base_branch || 'main').trim();
     if (!/^[\w./-]+$/.test(target)) return json(res, 400, { error: 'nama branch tidak valid' });
+    // branch task bisa sudah tidak ada (pernah di-merge/dihapus manual) -> jangan biarkan git yang mengeluh
+    const dir0 = safeDir(t.root, t.folder);
+    const stillThere = await git(dir0, ['branch', '--list', t.branch]).catch(() => '');
+    if (!stillThere) {
+      return json(res, 409, { error: `branch ${t.branch} sudah tidak ada di repo (mungkin sudah di-merge atau dihapus). Klik ULANG untuk membersihkan task.` });
+    }
     try {
       const { target: merged, stashed, pushed, pushNote } = await mergeInto(t, target);
       q.upd(t.id, { merged_branch: merged,
@@ -523,8 +529,7 @@ http.createServer(async (req, res) => {
           + (stashed ? `\n[perubahan lokal otomatis di-stash: kanban-merge-${t.id}-auto]` : '')
           + '\n\n[smoke test: menjalankan aplikasi, tunggu sampai 20 detik]' });
       // smoke test dijalankan setelah merge, hasilnya menempel ke log task
-      const dir = safeDir(t.root, t.folder);
-      smokeTest(dir).then(sm => {
+      smokeTest(dir0).then(sm => {
         q.upd(t.id, { smoke_ok: sm.ok === null ? null : (sm.ok ? 1 : 0), smoke_note: sm.note,
           output: (q.get(t.id).output || '') + `\n[smoke test ${sm.kind ? '(' + sm.kind + ') ' : ''}${sm.ok === null ? 'dilewati' : sm.ok ? 'OK' : 'GAGAL'}: ${sm.note}]`
             + (sm.out ? `\n${sm.out}` : '') });

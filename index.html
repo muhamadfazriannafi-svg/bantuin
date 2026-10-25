@@ -213,7 +213,8 @@ function card(t) {
       ${(t.status === 'todo' || t.status === 'error') ? `<button class="btn go" onclick="run(${t.id})">RUN</button>` : ''}
       ${t.status === 'review' ? `<button class="btn approve" onclick="approve(${t.id})">APPROVE</button>
                                  <button class="btn" onclick="reject(${t.id})">TOLAK</button>` : ''}
-      ${t.status === 'done' ? `<button class="btn approve" onclick="mergeDlg(${t.id})">MERGE</button>
+      ${t.status === 'done' ? `${t.branch ? `<button class="btn approve" onclick="mergeDlg(${t.id})">MERGE</button>` : ''}
+                               ${t.merged_branch ? `<span style="font-size:7px;color:var(--acc)">merged: ${esc(t.merged_branch)}</span>` : ''}
                                <button class="btn" onclick="resetTask(${t.id})">ULANG</button>` : ''}
       <button class="btn del" onclick="del(${t.id})">X</button>
     </div>
