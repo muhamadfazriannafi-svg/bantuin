@@ -2,8 +2,13 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const { execFile, spawn } = require('child_process');
 const { DatabaseSync } = require('node:sqlite');
+
+// identitas commit otomatis
+const GIT_NAME = process.env.GIT_USER_NAME || 'kanban';
+const GIT_EMAIL = process.env.GIT_USER_EMAIL || 'kanban@localhost';
 
 const PORT = Number(process.env.PORT) || 8790;
 const AGENT = process.env.AGENT_CMD || 'C:\\Program Files\\nodejs\\node_modules\\@opencode\\cli\\bin\\opencode.exe';
@@ -33,6 +38,10 @@ db.exec(`CREATE TABLE IF NOT EXISTS root (
 // Migrasi ringan untuk DB lama.
 try { db.exec('ALTER TABLE task ADD COLUMN start_date TEXT'); } catch {}
 try { db.exec('ALTER TABLE task ADD COLUMN base_branch TEXT'); } catch {}
+try { db.exec('ALTER TABLE task ADD COLUMN merged_branch TEXT'); } catch {}
+try { db.exec('ALTER TABLE task ADD COLUMN pushed INTEGER NOT NULL DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE task ADD COLUMN smoke_ok INTEGER'); } catch {}
+try { db.exec('ALTER TABLE task ADD COLUMN smoke_note TEXT'); } catch {}
 
 // Seed awal cuma kalau tabel kosong. Env ROOTS/WORK_ROOT dipakai sekali di sini.
 const seed = (table, vals) => {
@@ -87,33 +96,119 @@ function safeDir(root, name, requireGit = true) {
   return real;
 }
 
+// Alur: BUAT TASK -> branch task/<id> -> RUN -> APPROVE (commit+push) -> DONE (merge + smoke test)
 async function ensureBranch(dir, id) {
   const branch = `task/${id}`;
   const dirty = await git(dir, ['status', '--porcelain']);
   const cur = await git(dir, ['branch', '--show-current']);
-  // cabang asal dicatat supaya APPROVE tahu harus merge ke mana
-  const base = (cur && cur !== branch) ? cur : (await git(dir, ['rev-parse', '--abbrev-ref', 'HEAD']).catch(() => 'main'));
-  if (cur === branch) return { branch, base };
-  if (dirty && dirty !== '') {
-    // ponytail: simpan work-in-progress user di stash, bukan ditimpa. Ceiling: tidak auto-pop.
-    await git(dir, ['stash', 'push', '-u', '-m', `kanban-${id}-auto`]);
+  const base = (cur && !cur.startsWith('task/')) ? cur : (await git(dir, ['rev-parse', '--abbrev-ref', 'HEAD']).catch(() => 'main'));
+  // commit otomatis dulu supaya kerjaan yang belum di-commit tidak hilang saat pindah branch
+  if (dirty && cur && !cur.startsWith('task/')) {
+    await autoCommit(dir, `chore: simpan perubahan sebelum task ${id}`);
   }
   const exists = await git(dir, ['branch', '--list', branch]).catch(() => '');
   await git(dir, exists ? ['checkout', branch] : ['checkout', '-b', branch]);
   return { branch, base };
 }
 
-// APPROVE: merge branch task ke cabang asal, hapus branch task.
-async function mergeTask(t) {
-  const dir = safeDir(t.root, t.folder);
-  const branch = t.branch || `task/${t.id}`;
-  const base = t.base_branch || 'main';
+// Commit otomatis semua perubahan. Tidak melakukan apa pun kalau tree sudah bersih.
+async function autoCommit(dir, msg) {
   const dirty = await git(dir, ['status', '--porcelain']);
-  if (dirty) throw new Error('working tree kotor, commit/stash dulu sebelum approve');
-  await git(dir, ['checkout', base]);
-  await git(dir, ['merge', '--no-ff', '-m', `merge kanban-${t.id}: ${t.title}`, branch]);
-  await git(dir, ['branch', '-d', branch]).catch(() => {}); // gagal diam-diam kalau belum ter-merge
-  return base;
+  if (!dirty) return { committed: false, head: '' };
+  await git(dir, ['add', '-A']);
+  await git(dir, ['-c', `user.name=${GIT_NAME}`, '-c', `user.email=${GIT_EMAIL}`, 'commit', '-m', msg]);
+  const head = await git(dir, ['rev-parse', '--short', 'HEAD']);
+  return { committed: true, head };
+}
+
+// APPROVE: commit + push branch task ke origin.
+async function approveBranch(t) {
+  const dir = safeDir(t.root, t.folder);
+  const branch = t.branch;
+  if (!branch) throw new Error('task belum punya branch');
+  const cur = await git(dir, ['branch', '--show-current']);
+  if (cur !== branch) await git(dir, ['checkout', branch]);
+  const c = await autoCommit(dir, `feat(kanban-${t.id}): ${t.title}`);
+  const remote = await git(dir, ['remote', 'get-url', 'origin']).catch(() => '');
+  if (!remote) return { ...c, pushed: false, pushNote: 'tidak ada remote origin, push dilewati' };
+  try {
+    await git(dir, ['push', '-u', 'origin', branch]);
+    return { ...c, pushed: true, pushNote: '' };
+  } catch (e) {
+    return { ...c, pushed: false, pushNote: 'push gagal: ' + e.message.split('\n')[0] };
+  }
+}
+
+// DONE: merge branch task ke target, lalu smoke test aplikasi.
+// Working tree kotor di-commit otomatis, sisanya di-stash, supaya merge tidak diblokir.
+async function mergeInto(t, target) {
+  const dir = safeDir(t.root, t.folder);
+  const branch = t.branch;
+  const ada = await git(dir, ['branch', '--list', target]);
+  if (!ada) throw new Error(`branch ${target} tidak ada di repo`);
+  await autoCommit(dir, `chore: simpan perubahan sebelum merge kanban-${t.id}`);
+  const dirty = await git(dir, ['status', '--porcelain']);
+  let stashed = false;
+  if (dirty) {
+    await git(dir, ['stash', 'push', '-u', '-m', `kanban-merge-${t.id}-auto`]);
+    stashed = true;
+  }
+  let pushed = false, pushNote = '';
+  try {
+    await git(dir, ['checkout', target]);
+    await git(dir, ['merge', '--no-ff', '-m', `merge kanban-${t.id}: ${t.title}`, branch]);
+    await git(dir, ['branch', '-d', branch]).catch(() => {});
+    const remote = await git(dir, ['remote', 'get-url', 'origin']).catch(() => '');
+    if (remote) {
+      try { await git(dir, ['push', 'origin', target]); pushed = true; }
+      catch (e) { pushNote = 'push gagal: ' + e.message.split('\n')[0]; }
+    }
+  } catch (e) {
+    // merge gagal (bentrok): batalkan supaya repo tidak tertinggal setengah merge
+    await git(dir, ['merge', '--abort']).catch(() => {});
+    throw new Error(e.message + (stashed ? `\n\nperubahan lokal disimpan di stash: kanban-merge-${t.id}-auto` : ''));
+  }
+  return { target, stashed, pushed, pushNote };
+}
+
+// Smoke test: jalankan backend/frontend sebentar, ambil output. Tidak menggantung.
+function detectStart(dir) {
+  const has = f => fs.existsSync(path.join(dir, f));
+  if (has('composer.json') && has('artisan')) return { cmd: 'php', args: ['artisan', 'serve', '--port=8123'], kind: 'backend laravel' };
+  if (has('package.json')) {
+    try {
+      const pkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'));
+      const s = pkg.scripts || {};
+      for (const key of ['dev', 'start', 'serve']) if (s[key]) return { cmd: 'npm', args: ['run', key], kind: `npm run ${key}` };
+    } catch {}
+  }
+  return null;
+}
+
+function smokeTest(dir) {
+  const det = detectStart(dir);
+  if (!det) return Promise.resolve({ ok: null, note: 'tidak ada package.json/artisan, smoke test dilewati', out: '' });
+  return new Promise(resolve => {
+    const logFile = path.join(os.tmpdir(), `kanban-smoke-${Date.now()}.log`);
+    const fd = fs.openSync(logFile, 'w');
+    // shell: true karena npm/php di Windows berupa .cmd
+    const child = spawn(det.cmd, det.args, { cwd: dir, shell: true, windowsHide: true, stdio: ['ignore', fd, fd] });
+    fs.closeSync(fd);
+    let done = false;
+    const finish = (ok, note) => {
+      if (done) return;
+      done = true;
+      try { child.kill(); } catch {}
+      let out = '';
+      try { out = fs.readFileSync(logFile, 'utf8'); } catch {}
+      fs.rmSync(logFile, { force: true });
+      resolve({ ok, note, kind: det.kind, out: out.replace(/\x1b\[[0-9;]*m/g, '').slice(0, 4000) });
+    };
+    child.on('error', e => finish(false, 'gagal start: ' + e.message));
+    child.on('exit', code => finish(code === 0, `proses keluar dengan kode ${code}`));
+    // anggap sukses kalau 20 detik masih hidup (dev server memang tidak exit)
+    setTimeout(() => finish(true, 'masih berjalan setelah 20 detik'), 20000);
+  });
 }
 
 // TOLAK: balik ke cabang asal, buang branch task.
@@ -233,7 +328,7 @@ const body = req => new Promise(r => { let b = ''; req.on('data', c => b += c); 
 
 http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
-  const m = url.pathname.match(/^\/api\/tasks\/(\d+)(\/run|\/cancel|\/approve|\/reject)?$/);
+  const m = url.pathname.match(/^\/api\/tasks\/(\d+)(\/run|\/cancel|\/approve|\/reject|\/reset|\/merge)?$/);
   const mm = url.pathname.match(/^\/api\/(roots|models)\/(\d+)$/);
 
   if (url.pathname === '/' || url.pathname === '/index.html') {
@@ -338,6 +433,15 @@ http.createServer(async (req, res) => {
   // --- task ---
   if (url.pathname === '/api/tasks' && req.method === 'GET')
     return json(res, 200, { tasks: q.all(), models: modelNames(), cols: COLS, roots: rootsWithReal().map(r => r.path) });
+  if (url.pathname === '/api/branches') {
+    // daftar branch lokal sebuah folder, untuk dropdown merge
+    try {
+      const dir = safeDir(url.searchParams.get('root'), url.searchParams.get('folder'));
+      const out = await git(dir, ['branch', '--format=%(refname:short)']);
+      const cur = await git(dir, ['branch', '--show-current']).catch(() => '');
+      return json(res, 200, out.split('\n').map(s => s.trim()).filter(Boolean).map(name => ({ name, current: name === cur })));
+    } catch (e) { return json(res, 400, { error: e.message }); }
+  }
   if (url.pathname === '/api/tasks' && req.method === 'POST') {
     const b = await body(req);
     if (!b.title || !b.folder || !b.prompt || !b.root) return json(res, 400, { error: 'root/folder/title/prompt wajib' });
@@ -356,7 +460,7 @@ http.createServer(async (req, res) => {
     if (b.status) {
       if (!COLS.includes(b.status)) return json(res, 400, { error: 'status invalid' });
       patch.status = b.status;
-      if (b.status === 'todo') { patch.output = ''; patch.diff = ''; patch.branch = null; }
+      if (b.status === 'todo') { patch.output = ''; patch.diff = ''; patch.branch = null; patch.smoke_ok = null; patch.smoke_note = null; }
     }
     if (typeof b.title === 'string') patch.title = b.title;
     if (typeof b.prompt === 'string') patch.prompt = b.prompt;
@@ -365,20 +469,66 @@ http.createServer(async (req, res) => {
     q.upd(+m[1], patch);
     return json(res, 200, q.get(+m[1]));
   }
+  if (m && m[2] === '/reset' && req.method === 'POST') {
+    const t = q.get(+m[1]);
+    if (!t) return json(res, 404, { error: 'tidak ada' });
+    if (running.has(t.id)) return json(res, 409, { error: 'task masih jalan' });
+    let note = '';
+    if (t.branch) {
+      try {
+        const base = await discardTask(t);   // buang branch + balik ke base_branch
+        note = `[reset: branch ${t.branch} dihapus, kembali ke ${base}]`;
+      } catch (e) {
+        note = `[reset: gagal bersihkan branch ${t.branch}: ${e.message}]`;
+      }
+    }
+    q.upd(t.id, { status: 'todo', output: note, diff: '', branch: null });
+    return json(res, 200, q.get(t.id));
+  }
   if (m && (m[2] === '/approve' || m[2] === '/reject') && req.method === 'POST') {
     const t = q.get(+m[1]);
     if (!t) return json(res, 404, { error: 'tidak ada' });
     if (running.has(t.id)) return json(res, 409, { error: 'task masih jalan' });
     try {
       if (m[2] === '/approve') {
-        const base = await mergeTask(t);
-        q.upd(t.id, { status: 'done', base_branch: base, ended: new Date().toISOString(),
-          output: (t.output || '') + `\n\n[diapprove: branch ${t.branch || 'task/' + t.id} di-merge ke ${base}]` });
+        // APPROVE = commit + push branch task. Merge dilakukan terpisah lewat /merge.
+        const r = await approveBranch(t);
+        q.upd(t.id, { status: 'done', ended: new Date().toISOString(), pushed: r.pushed ? 1 : 0,
+          output: (t.output || '') + `\n\n[disetujui: ${r.committed ? 'commit ' + r.head + ' dibuat, ' : 'tidak ada perubahan baru, '}`
+            + (r.pushed ? `branch ${t.branch} di-push ke origin` : r.pushNote) + ']' });
       } else {
         const base = await discardTask(t);
         q.upd(t.id, { status: 'error', base_branch: base,
           output: (t.output || '') + `\n\n[ditolak: branch ${t.branch || 'task/' + t.id} dihapus, kembali ke ${base}]` });
       }
+      return json(res, 200, q.get(t.id));
+    } catch (e) {
+      return json(res, 500, { error: e.message });
+    }
+  }
+  if (m && m[2] === '/merge' && req.method === 'POST') {
+    const t = q.get(+m[1]);
+    if (!t) return json(res, 404, { error: 'tidak ada' });
+    if (running.has(t.id)) return json(res, 409, { error: 'task masih jalan' });
+    if (t.status !== 'done') return json(res, 409, { error: 'merge hanya dari kolom done' });
+    if (!t.branch) return json(res, 409, { error: 'task belum punya branch' });
+    const b = await body(req);
+    const target = String(b.target || t.base_branch || 'main').trim();
+    if (!/^[\w./-]+$/.test(target)) return json(res, 400, { error: 'nama branch tidak valid' });
+    try {
+      const { target: merged, stashed, pushed, pushNote } = await mergeInto(t, target);
+      q.upd(t.id, { merged_branch: merged,
+        output: (t.output || '') + `\n\n[merge: ${t.branch} -> ${merged}, branch task dihapus]`
+          + (pushed ? `\n[push ${merged} ke origin]` : pushNote ? `\n[${pushNote}]` : '')
+          + (stashed ? `\n[perubahan lokal otomatis di-stash: kanban-merge-${t.id}-auto]` : '')
+          + '\n\n[smoke test: menjalankan aplikasi, tunggu sampai 20 detik]' });
+      // smoke test dijalankan setelah merge, hasilnya menempel ke log task
+      const dir = safeDir(t.root, t.folder);
+      smokeTest(dir).then(sm => {
+        q.upd(t.id, { smoke_ok: sm.ok === null ? null : (sm.ok ? 1 : 0), smoke_note: sm.note,
+          output: (q.get(t.id).output || '') + `\n[smoke test ${sm.kind ? '(' + sm.kind + ') ' : ''}${sm.ok === null ? 'dilewati' : sm.ok ? 'OK' : 'GAGAL'}: ${sm.note}]`
+            + (sm.out ? `\n${sm.out}` : '') });
+      }).catch(() => {});
       return json(res, 200, q.get(t.id));
     } catch (e) {
       return json(res, 500, { error: e.message });

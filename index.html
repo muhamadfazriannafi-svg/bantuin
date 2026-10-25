@@ -99,6 +99,20 @@
   </div>
 </div>
 
+<dialog id="merge">
+  <h2 style="font-size:10px;margin:0 0 10px">MERGE KE BRANCH</h2>
+  <div class="dl-meta">
+    <span>task</span><b id="m-task"></b>
+    <span>branch asal</span><b id="m-branch"></b>
+  </div>
+  <label>branch tujuan</label>
+  <select id="m-target"></select>
+  <div class="dl-actions" style="margin-top:12px">
+    <button class="btn go" id="m-go" onclick="doMerge()">MERGE</button>
+    <button class="btn" onclick="document.getElementById('merge').close()">BATAL</button>
+  </div>
+</dialog>
+
 <dialog id="detail">
   <h2 id="d-title" style="font-size:10px;margin:0 0 10px;word-break:break-word"></h2>
   <div class="dl-meta">
@@ -107,12 +121,20 @@
     <span>model</span><b id="d-model"></b>
     <span>agent</span><b id="d-agent"></b>
     <span>branch</span><b id="d-branch"></b>
+    <span>push</span><b id="d-pushed"></b>
+    <span>smoke test</span><b id="d-smoke"></b>
     <span>tanggal mulai</span><b id="d-startdate"></b>
     <span>mulai</span><b id="d-started"></b>
     <span>selesai</span><b id="d-ended"></b>
   </div>
   <label>prompt</label>
-  <pre id="d-prompt" class="log" style="max-height:14vh"></pre>
+  <textarea id="d-prompt-edit" style="height:90px"></textarea>
+  <div style="display:flex;gap:8px;margin-bottom:8px">
+    <button class="btn go" onclick="saveTask()">SIMPAN PERUBAHAN</button>
+    <button class="btn" onclick="resetTask(taskId)">ULANG (HAPUS BRANCH)</button>
+  </div>
+  <details><summary>prompt tersimpan</summary>
+    <pre id="d-prompt" class="log" style="max-height:14vh"></pre></details>
   <label style="display:block;margin-top:8px">diff (ringkas)</label>
   <pre id="d-diff" class="log" style="max-height:14vh"></pre>
   <label style="display:block;margin-top:8px">output agent</label>
@@ -191,7 +213,8 @@ function card(t) {
       ${(t.status === 'todo' || t.status === 'error') ? `<button class="btn go" onclick="run(${t.id})">RUN</button>` : ''}
       ${t.status === 'review' ? `<button class="btn approve" onclick="approve(${t.id})">APPROVE</button>
                                  <button class="btn" onclick="reject(${t.id})">TOLAK</button>` : ''}
-      ${t.status === 'done' ? `<button class="btn" onclick="setStatus(${t.id},'todo')">ULANG</button>` : ''}
+      ${t.status === 'done' ? `<button class="btn approve" onclick="mergeDlg(${t.id})">MERGE</button>
+                               <button class="btn" onclick="resetTask(${t.id})">ULANG</button>` : ''}
       <button class="btn del" onclick="del(${t.id})">X</button>
     </div>
     ${(t.output || t.diff) ? `<details onclick="event.stopPropagation()"><summary>LOG</summary>
@@ -214,14 +237,84 @@ async function setStatus(id, status) {
   load();
 }
 
+// --- merge dari kolom done ---
+let mergeTaskId = null, mergeFolder = null;
+async function mergeDlg(id) {
+  const t = S.tasks.find(x => x.id === id);
+  if (!t) return;
+  if (!t.branch) return alert('task ini belum punya branch (dijalankan sebelum fitur branch dicatat)');
+  mergeTaskId = id; mergeFolder = { root: t.root, folder: t.folder };
+  document.getElementById('m-task').textContent = `#${t.id} ${t.title}`;
+  document.getElementById('m-branch').textContent = t.branch;
+  const select = document.getElementById('m-target');
+  select.innerHTML = '<option>memuat...</option>';
+  document.getElementById('merge').showModal();
+  try {
+    const r = await fetch(`/api/branches?root=${encodeURIComponent(t.root)}&folder=${encodeURIComponent(t.folder)}`);
+    const b = await r.json();
+    if (!Array.isArray(b)) throw new Error(b.error || 'gagal');
+    const list = b.filter(x => x.name !== t.branch);
+    select.innerHTML = list.map(x => `<option value="${esc(x.name)}" ${x.name === 'main' || x.name === 'master' ? 'selected' : ''}>${esc(x.name)}</option>`).join('')
+      || '<option value="">(tidak ada branch lain)</option>';
+  } catch (e) {
+    select.innerHTML = `<option value="">${esc(e.message)}</option>`;
+  }
+}
+
+async function doMerge() {
+  const target = document.getElementById('m-target').value;
+  if (!target) return alert('pilih branch tujuan');
+  const btn = document.getElementById('m-go');
+  btn.disabled = true; btn.textContent = 'MERGE...';
+  try {
+    const r = await fetch(`/api/tasks/${mergeTaskId}/merge`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ target }),
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || 'gagal merge');
+    document.getElementById('merge').close();
+    alert(`merge ke ${target} selesai. Smoke test jalan ±20 detik, cek log task.`);
+    load();
+    setTimeout(() => load(), 22000);
+  } catch (e) {
+    alert('gagal merge: ' + e.message);
+  } finally {
+    btn.disabled = false; btn.textContent = 'MERGE';
+  }
+}
+
+async function saveTask() {
+  const prompt = document.getElementById('d-prompt-edit').value;
+  if (!prompt.trim()) return alert('prompt tidak boleh kosong');
+  const r = await fetch('/api/tasks/' + taskId, {
+    method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ prompt }),
+  });
+  const j = await r.json();
+  if (!r.ok) return alert('gagal: ' + j.error);
+  await load();
+  detail(taskId);
+}
+
+async function resetTask(id) {  const t = S.tasks.find(x => x.id === id);
+  const branch = t?.branch || `task/${id}`;
+  if (!confirm(`Ulangi task dari nol?\n\nBranch ${branch} akan DIHAPUS dan kode kembali ke ${t?.base_branch || 'main'}. Hasil kerja sebelumnya hilang.`)) return;
+  const r = await fetch(`/api/tasks/${id}/reset`, { method: 'POST' });
+  const j = await r.json();
+  if (!r.ok) { alert('gagal: ' + j.error); return; }
+  load();
+}
+
 async function approve(id) {
   const t = S.tasks.find(x => x.id === id);
   const branch = t?.branch || `task/${id}`;
   const base = t?.base_branch || 'main';
-  if (!confirm(`Merge ${branch} ke ${base}?\n\nBranch task akan dihapus setelah merge.`)) return;
+  if (!confirm(`Approve task #${id}?\n\nCommit otomatis + push branch ${branch} ke origin.`)) return;
   const r = await fetch(`/api/tasks/${id}/approve`, { method: 'POST' });
   const j = await r.json();
-  if (!r.ok) { alert('gagal merge: ' + j.error); return; }
+  if (!r.ok) { alert('gagal approve: ' + j.error); return; }
+  if (!j.pushed) alert('commit dibuat, tapi push gagal. Lihat log task.');
   load();
 }
 
@@ -402,9 +495,14 @@ function detail(id) {
   document.getElementById('d-model').textContent = t.model;
   document.getElementById('d-agent').textContent = t.agent || '(default)';
   document.getElementById('d-branch').textContent = t.branch || '-';
+  document.getElementById('d-pushed').textContent = t.pushed ? 'sudah di-push ke origin' : 'belum di-push';
+  document.getElementById('d-smoke').textContent = t.smoke_ok === 1 ? 'OK — ' + (t.smoke_note || '')
+    : t.smoke_ok === 0 ? 'GAGAL — ' + (t.smoke_note || '')
+    : t.smoke_note || 'belum dijalankan';
   document.getElementById('d-startdate').textContent = t.start_date || '-';
   document.getElementById('d-started').textContent = fmt(t.started);  document.getElementById('d-ended').textContent = fmt(t.ended);
   document.getElementById('d-prompt').textContent = t.prompt || '(kosong)';
+  document.getElementById('d-prompt-edit').value = t.prompt || '';
   document.getElementById('d-diff').textContent = t.diff || '(tidak ada perubahan file)';
   const log = document.getElementById('d-log');
   log.textContent = t.output || (t.status === 'doing' ? 'masih berjalan...' : '(output kosong)');
