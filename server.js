@@ -42,6 +42,8 @@ try { db.exec('ALTER TABLE task ADD COLUMN merged_branch TEXT'); } catch {}
 try { db.exec('ALTER TABLE task ADD COLUMN pushed INTEGER NOT NULL DEFAULT 0'); } catch {}
 try { db.exec('ALTER TABLE task ADD COLUMN smoke_ok INTEGER'); } catch {}
 try { db.exec('ALTER TABLE task ADD COLUMN smoke_note TEXT'); } catch {}
+try { db.exec('ALTER TABLE task ADD COLUMN archived INTEGER NOT NULL DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE task ADD COLUMN commit_hash TEXT'); } catch {}
 
 // Seed awal cuma kalau tabel kosong. Env ROOTS/WORK_ROOT dipakai sekali di sini.
 const seed = (table, vals) => {
@@ -77,6 +79,16 @@ const rootsWithReal = () => q.roots().filter(r => r.active).map(r => {
   try { return { path: r.path, real: fs.realpathSync(r.path) }; } catch { return null; }
 }).filter(Boolean);
 const modelNames = () => q.models().filter(m => m.active).map(m => m.name);
+// Cari root aktif dari path apa pun bentuknya (case/trailing slash/short path Windows).
+const findRoot = p => {
+  if (!p) return null;
+  const all = rootsWithReal();
+  const exact = all.find(x => x.path === p);
+  if (exact) return exact;
+  let real;
+  try { real = fs.realpathSync(p); } catch { return null; }
+  return all.find(x => x.real === real) || null;
+};
 
 // --- git helper ---
 const git = (cwd, args) => new Promise((res, rej) => {
@@ -85,13 +97,18 @@ const git = (cwd, args) => new Promise((res, rej) => {
 
 // Folder task: nama relatif di bawah root terpilih. Tolak traversal & symlink keluar.
 // requireGit=false dipakai saat akan membuat repo baru (folder memang belum punya .git).
-function safeDir(root, name, requireGit = true) {
-  const r = rootsWithReal().find(x => x.path === root);
+// allowMissing=true dipakai /api/repo: folder kosong baru dibuat, divalidasi tanpa realpath.
+function safeDir(root, name, requireGit = true, allowMissing = false) {
+  const r = rootsWithReal().find(x => x.path === root) || findRoot(root);
   if (!r) throw new Error('root tidak dikenal');
   if (!name || !/^[\w.-]+$/.test(name) || name === '.' || name === '..') throw new Error('nama folder tidak valid');
-  const real = fs.realpathSync(path.resolve(r.path, name));
+  const abs = path.resolve(r.path, name);
+  if (!abs.startsWith(r.real + path.sep)) throw new Error('folder di luar root');
+  const exists = fs.existsSync(abs);
+  if (!exists && !allowMissing) throw new Error('folder tidak ada');
+  const real = exists ? fs.realpathSync(abs) : abs;
   if (!real.startsWith(r.real + path.sep)) throw new Error('folder di luar root');
-  if (!fs.statSync(real).isDirectory()) throw new Error('bukan folder');
+  if (exists && !fs.statSync(real).isDirectory()) throw new Error('bukan folder');
   if (requireGit && !fs.existsSync(path.join(real, '.git'))) throw new Error('folder tanpa git repo');
   return real;
 }
@@ -168,7 +185,7 @@ async function mergeInto(t, target) {
     await git(dir, ['merge', '--abort']).catch(() => {});
     throw new Error(e.message + (stashed ? `\n\nperubahan lokal disimpan di stash: kanban-merge-${t.id}-auto` : ''));
   }
-  return { target, stashed, pushed, pushNote };
+  return { target, stashed, pushed, pushNote, head: await git(dir, ['rev-parse', '--short', 'HEAD']).catch(() => '') };
 }
 
 // Smoke test: jalankan backend/frontend sebentar, ambil output. Tidak menggantung.
@@ -238,11 +255,17 @@ function runTask(t) {
     }
     const args = ['run', '--model', t.model, '--title', `kanban-${t.id}: ${t.title}`, '--auto', '--format', 'json'];
     args.push(t.prompt);
-    // spawn (bukan execFile) supaya output bisa ditulis ke DB bertahap = log live.
-    // --format json wajib: mode teks default menahan output saat bukan TTY (nol byte sampai selesai).
-    const child = spawn(AGENT, args, { cwd: dir, env: process.env, shell: AGENT_SHELL, windowsHide: true });
+    // stdio ke FILE, bukan pipe: opencode.exe di Windows sering tidak menulis apa pun ke pipe
+    // (terbukti: pipe 0 byte, file ratusan byte). Tail file untuk log live.
+    const logPath = path.join(os.tmpdir(), `kanban-${t.id}-${Date.now()}.jsonl`);
+    const fd = fs.openSync(logPath, 'w');
+    const child = spawn(AGENT, args, {
+      cwd: dir, env: process.env, shell: AGENT_SHELL, windowsHide: true,
+      stdio: ['ignore', fd, fd],
+    });
+    fs.closeSync(fd);                   // anak sudah memegang handle sendiri
     procs.set(t.id, child);
-    let buf = '', pending = false, rest = '';
+    let buf = '', pending = false, rest = '', offset = 0;
     const clean = s => String(s || '').replace(/\x1b\[[0-9;]*m/g, '');
     const flush = () => {
       if (pending) return;              // throttle: 1 tulis / 800ms
@@ -287,8 +310,20 @@ function runTask(t) {
         try { push(render(JSON.parse(ln))); } catch { push(ln + '\n'); } // bukan JSON = tulis apa adanya
       }
     };
-    child.stdout.on('data', onData);
-    child.stderr.on('data', onData);
+    // baca bagian file yang baru bertambah saja
+    const drain = () => {
+      try {
+        const st = fs.statSync(logPath);
+        if (st.size <= offset) return;
+        const fd2 = fs.openSync(logPath, 'r');
+        const b = Buffer.alloc(st.size - offset);
+        fs.readSync(fd2, b, 0, b.length, offset);
+        fs.closeSync(fd2);
+        offset = st.size;
+        onData(b.toString('utf8'));
+      } catch {}
+    };
+    const tailer = setInterval(drain, 700);
 
     const timer = setTimeout(() => { buf = 'TIMEOUT\n' + buf; child.kill(); }, TIMEOUT);
     let spawnErr = null;
@@ -297,6 +332,8 @@ function runTask(t) {
 
     child.on('close', async (code, signal) => {
       clearTimeout(timer);
+      clearInterval(tailer);
+      drain();                          // ambil sisa output yang belum terbaca
       if (!buf && rest) { buf = rest; rest = ''; }   // baris terakhir tanpa newline
       let output = buf;
       if (!output.trim()) output = spawnErr
@@ -318,6 +355,13 @@ function runTask(t) {
       cancelledIds.delete(t.id);
       procs.delete(t.id);
       running.delete(t.id);
+      // simpan log mentah ke output kalau render menghasilkan nol baris, biar tidak "0 byte" tanpa jejak
+      if (!output.trim()) {
+        let raw = '';
+        try { raw = clean(fs.readFileSync(logPath, 'utf8')).trim(); } catch {}
+        if (raw) q.upd(t.id, { output: `EXIT ${code ?? signal}\n(raw output, ${raw.length} byte)\n\n` + raw.slice(-20000) });
+      }
+      fs.rmSync(logPath, { force: true });
     });
   })();
 }
@@ -335,8 +379,22 @@ http.createServer(async (req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     return res.end(fs.readFileSync(path.join(__dirname, 'index.html')));
   }
+  // Buat folder repo di bawah root kalau belum ada (idempoten). Root divalidasi lewat realpath.
+  if (url.pathname === '/api/folders' && req.method === 'POST') {
+    const b = await body(req);
+    const r = findRoot(b.root);
+    if (!r) return json(res, 400, { error: 'root tidak dikenal' });
+    const name = String(b.folder || '').trim();
+    if (!/^[\w.-]+$/.test(name) || name === '.' || name === '..') return json(res, 400, { error: 'nama folder tidak valid' });
+    const abs = path.resolve(r.path, name);
+    fs.mkdirSync(abs, { recursive: true });
+    const real = fs.realpathSync(abs);
+    if (!real.startsWith(r.real + path.sep)) return json(res, 400, { error: 'folder di luar root' });
+    if (!fs.statSync(real).isDirectory()) return json(res, 400, { error: 'bukan folder' });
+    return json(res, 200, { ok: true, path: real });
+  }
   if (url.pathname === '/api/folders') {
-    const r = rootsWithReal().find(x => x.path === url.searchParams.get('root'));
+    const r = findRoot(url.searchParams.get('root'));
     if (!r) return json(res, 400, { error: 'root tidak dikenal' });
     return json(res, 200, fs.readdirSync(r.path, { withFileTypes: true })
       .filter(d => d.isDirectory() && !d.name.startsWith('.')).map(d => d.name));
@@ -366,7 +424,7 @@ http.createServer(async (req, res) => {
     const name = String(b.name || '').trim();
     if (!/^[\w.-]{1,100}$/.test(name)) return json(res, 400, { error: 'nama repo tidak valid' });
     let dir;
-    try { dir = safeDir(b.root, b.folder, false); } catch (e) { return json(res, 400, { error: e.message }); }
+    try { dir = safeDir(b.root, b.folder, false, true); } catch (e) { return json(res, 400, { error: e.message }); }
     if (fs.existsSync(path.join(dir, '.git'))) return json(res, 409, { error: 'folder sudah punya git repo' });
     const priv = b.visibility !== 'public';
     const run = (cmd, args, cwd) => new Promise((ok, no) => {
@@ -396,7 +454,7 @@ http.createServer(async (req, res) => {
   if (url.pathname === '/api/repo' && req.method === 'GET') {
     // Info repo untuk folder task (dipakai UI sebelum menampilkan tombol).
     try {
-      const dir = safeDir(url.searchParams.get('root'), url.searchParams.get('folder'), false);
+      const dir = safeDir(url.searchParams.get('root'), url.searchParams.get('folder'), false, true);
       const hasGit = fs.existsSync(path.join(dir, '.git'));
       let remote = '';
       if (hasGit) remote = await git(dir, ['remote', 'get-url', 'origin']).catch(() => '');
@@ -432,7 +490,10 @@ http.createServer(async (req, res) => {
 
   // --- task ---
   if (url.pathname === '/api/tasks' && req.method === 'GET')
-    return json(res, 200, { tasks: q.all(), models: modelNames(), cols: COLS, roots: rootsWithReal().map(r => r.path) });
+    return json(res, 200, { tasks: q.all().filter(t => !t.archived), models: modelNames(), cols: COLS, roots: rootsWithReal().map(r => r.path) });
+  // laporan: task yang sudah selesai merge (hilang dari board)
+  if (url.pathname === '/api/report' && req.method === 'GET')
+    return json(res, 200, { tasks: q.all().filter(t => t.archived) });
   if (url.pathname === '/api/branches') {
     // daftar branch lokal sebuah folder, untuk dropdown merge
     try {
@@ -460,7 +521,7 @@ http.createServer(async (req, res) => {
     if (b.status) {
       if (!COLS.includes(b.status)) return json(res, 400, { error: 'status invalid' });
       patch.status = b.status;
-      if (b.status === 'todo') { patch.output = ''; patch.diff = ''; patch.branch = null; patch.smoke_ok = null; patch.smoke_note = null; }
+      if (b.status === 'todo') { patch.output = ''; patch.diff = ''; patch.branch = null; patch.smoke_ok = null; patch.smoke_note = null; patch.archived = 0; patch.merged_branch = null; patch.commit_hash = null; }
     }
     if (typeof b.title === 'string') patch.title = b.title;
     if (typeof b.prompt === 'string') patch.prompt = b.prompt;
@@ -482,7 +543,7 @@ http.createServer(async (req, res) => {
         note = `[reset: gagal bersihkan branch ${t.branch}: ${e.message}]`;
       }
     }
-    q.upd(t.id, { status: 'todo', output: note, diff: '', branch: null });
+    q.upd(t.id, { status: 'todo', output: note, diff: '', branch: null, archived: 0, merged_branch: null, commit_hash: null, smoke_ok: null, smoke_note: null });
     return json(res, 200, q.get(t.id));
   }
   if (m && (m[2] === '/approve' || m[2] === '/reject') && req.method === 'POST') {
@@ -522,18 +583,20 @@ http.createServer(async (req, res) => {
       return json(res, 409, { error: `branch ${t.branch} sudah tidak ada di repo (mungkin sudah di-merge atau dihapus). Klik ULANG untuk membersihkan task.` });
     }
     try {
-      const { target: merged, stashed, pushed, pushNote } = await mergeInto(t, target);
-      q.upd(t.id, { merged_branch: merged,
+      const { target: merged, stashed, pushed, pushNote, head } = await mergeInto(t, target);
+      q.upd(t.id, { merged_branch: merged, commit_hash: head,
         output: (t.output || '') + `\n\n[merge: ${t.branch} -> ${merged}, branch task dihapus]`
+          + (head ? `\n[commit merge: ${head}]` : '')
           + (pushed ? `\n[push ${merged} ke origin]` : pushNote ? `\n[${pushNote}]` : '')
           + (stashed ? `\n[perubahan lokal otomatis di-stash: kanban-merge-${t.id}-auto]` : '')
           + '\n\n[smoke test: menjalankan aplikasi, tunggu sampai 20 detik]' });
-      // smoke test dijalankan setelah merge, hasilnya menempel ke log task
+      // smoke test dijalankan setelah merge; selesai (atau gagal) -> task masuk laporan
       smokeTest(dir0).then(sm => {
-        q.upd(t.id, { smoke_ok: sm.ok === null ? null : (sm.ok ? 1 : 0), smoke_note: sm.note,
-          output: (q.get(t.id).output || '') + `\n[smoke test ${sm.kind ? '(' + sm.kind + ') ' : ''}${sm.ok === null ? 'dilewati' : sm.ok ? 'OK' : 'GAGAL'}: ${sm.note}]`
+        const cur = q.get(t.id);
+        q.upd(t.id, { smoke_ok: sm.ok === null ? null : (sm.ok ? 1 : 0), smoke_note: sm.note, archived: 1,
+          output: (cur.output || '') + `\n[smoke test ${sm.kind ? '(' + sm.kind + ') ' : ''}${sm.ok === null ? 'dilewati' : sm.ok ? 'OK' : 'GAGAL'}: ${sm.note}]`
             + (sm.out ? `\n${sm.out}` : '') });
-      }).catch(() => {});
+      }).catch(() => { q.upd(t.id, { archived: 1, smoke_note: 'smoke test error' }); });
       return json(res, 200, q.get(t.id));
     } catch (e) {
       return json(res, 500, { error: e.message });

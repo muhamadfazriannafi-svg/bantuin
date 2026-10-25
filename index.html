@@ -71,12 +71,19 @@
 <header>
   <h1>&#9632; KANBAN AGENT</h1>
   <button class="btn go" onclick="openNew()">+ TASK</button>
+  <button class="btn" onclick="openFolder()">+ FOLDER</button>
   <button class="btn" id="tab-board" onclick="view('board')">BOARD</button>
+  <button class="btn" id="tab-report" onclick="view('report')">LAPORAN</button>
   <button class="btn" id="tab-master" onclick="view('master')">MASTER</button>
   <button class="btn" id="btn-theme" onclick="toggleTheme()" title="ganti tema">TERANG</button>
   <span class="m" id="hint" style="color:var(--dim);font-size:8px"></span>
 </header>
 <div id="board"></div>
+
+<div id="report" style="display:none;padding:16px">
+  <h2 style="font-size:10px;margin:0 0 10px"><span>LAPORAN TASK SELESAI</span><span id="report-count"></span></h2>
+  <div id="report-list"></div>
+</div>
 
 <div id="master" style="display:none;padding:16px;display:none">
   <div class="master-cols" style="display:grid;grid-template-columns:1fr 1fr;gap:16px;align-items:start">
@@ -98,6 +105,22 @@
     </div>
   </div>
 </div>
+
+<dialog id="folder-dlg">
+  <h2 style="font-size:10px;margin:0 0 10px">FOLDER BARU</h2>
+  <label>root (proyek)</label>
+  <select id="nf_root"></select>
+  <label>nama folder</label>
+  <input id="nf_name" placeholder="bantuin">
+  <label>repo github (opsional)</label>
+  <input id="nf_repo" placeholder="kosongkan kalau tidak perlu">
+  <label>visibilitas</label>
+  <select id="nf_vis"><option value="private">PRIVATE</option><option value="public">PUBLIC</option></select>
+  <div style="display:flex;gap:8px;margin-top:12px">
+    <button class="btn go" id="btn-nf" onclick="createFolder()">BUAT FOLDER</button>
+    <button class="btn" onclick="document.getElementById('folder-dlg').close()">BATAL</button>
+  </div>
+</dialog>
 
 <dialog id="merge">
   <h2 style="font-size:10px;margin:0 0 10px">MERGE KE BRANCH</h2>
@@ -275,9 +298,9 @@ async function doMerge() {
     const j = await r.json();
     if (!r.ok) throw new Error(j.error || 'gagal merge');
     document.getElementById('merge').close();
-    alert(`merge ke ${target} selesai. Smoke test jalan ±20 detik, cek log task.`);
+    alert(`merge ke ${target} selesai. Smoke test jalan ±20 detik, lalu kartu pindah ke LAPORAN.`);
     load();
-    setTimeout(() => load(), 22000);
+    setTimeout(() => { load(); if (curView === 'report') loadReport(); }, 22000);
   } catch (e) {
     alert('gagal merge: ' + e.message);
   } finally {
@@ -351,9 +374,19 @@ async function openNew() {
 async function loadFolders() {
   const root = document.getElementById('f_root').value;
   const folders = await (await fetch('/api/folders?root=' + encodeURIComponent(root))).json();
-  document.getElementById('f_folder').innerHTML = (Array.isArray(folders) ? folders : [])
-    .map(f => `<option>${esc(f)}</option>`).join('') || '<option value="">(kosong)</option>';
+  const list = Array.isArray(folders) ? folders : [];
+  document.getElementById('f_folder').innerHTML = list.map(f => `<option>${esc(f)}</option>`).join('')
+    || '<option value="">(belum ada folder — pakai + FOLDER)</option>';
   checkRepo();
+}
+
+async function ensureFolder(root, folder) {
+  // POST /api/folders idempoten: aman dipanggil walau folder sudah ada
+  const r = await fetch('/api/folders', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ root, folder }),
+  });
+  if (!r.ok) throw new Error((await r.json()).error || 'gagal buat folder');
 }
 
 async function checkRepo() {
@@ -378,13 +411,17 @@ async function createRepo() {
   const btn = document.getElementById('btn-repo');
   btn.disabled = true; btn.textContent = 'PROSES...';
   try {
+    const root = f_root.value, folder = f_folder.value;
+    await ensureFolder(root, folder);
     const r = await fetch('/api/repo', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ root: f_root.value, folder: f_folder.value, name, visibility }),
+      body: JSON.stringify({ root, folder, name, visibility }),
     });
     const j = await r.json();
     if (!r.ok) throw new Error(j.error || 'gagal');
     alert('repo dibuat: ' + (j.url || j.out || 'ok'));
+    await loadFolders();
+    document.getElementById('f_folder').value = folder;
     checkRepo();
   } catch (e) {
     alert('gagal: ' + e.message);
@@ -401,6 +438,44 @@ async function create() {
   const r = await fetch('/api/tasks', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(b) });
   if (!r.ok) return alert((await r.json()).error);
   dlg.close(); load();
+}
+
+// Menu "+ FOLDER": buat folder repo baru di bawah root, opsional langsung jadi repo GitHub.
+function openFolder() {
+  document.getElementById('nf_root').innerHTML = (S.roots || []).map(r => `<option>${esc(r)}</option>`).join('');
+  document.getElementById('nf_name').value = '';
+  document.getElementById('nf_repo').value = '';
+  document.getElementById('folder-dlg').showModal();
+}
+
+async function createFolder() {
+  const root = document.getElementById('nf_root').value;
+  const folder = document.getElementById('nf_name').value.trim();
+  const repo = document.getElementById('nf_repo').value.trim();
+  const visibility = document.getElementById('nf_vis').value;
+  if (!root) return alert('root wajib');
+  if (!/^[\w.-]+$/.test(folder) || folder === '.' || folder === '..') return alert('nama folder tidak valid');
+  const btn = document.getElementById('btn-nf');
+  btn.disabled = true; btn.textContent = 'PROSES...';
+  try {
+    await ensureFolder(root, folder);
+    let note = `folder ${folder} dibuat`;
+    if (repo) {
+      const r = await fetch('/api/repo', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ root, folder, name: repo, visibility }),
+      });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || 'gagal buat repo');
+      note = `folder ${folder} dibuat + repo ${j.url || repo}`;
+    }
+    document.getElementById('folder-dlg').close();
+    alert(note);
+  } catch (e) {
+    alert('gagal: ' + e.message);
+  } finally {
+    btn.disabled = false; btn.textContent = 'BUAT FOLDER';
+  }
 }
 
 load();
@@ -428,10 +503,42 @@ function view(v) {
   curView = v;
   document.getElementById('board').style.display = v === 'board' ? 'grid' : 'none';
   document.getElementById('master').style.display = v === 'master' ? 'block' : 'none';
-  document.getElementById('tab-board').classList.toggle('on', v === 'board');
-  document.getElementById('tab-master').classList.toggle('on', v === 'master');
+  document.getElementById('report').style.display = v === 'report' ? 'block' : 'none';
+  for (const k of ['board', 'report', 'master'])
+    document.getElementById('tab-' + k).classList.toggle('on', v === k);
   if (v === 'master') loadMaster();
+  else if (v === 'report') loadReport();
   else load();
+}
+
+async function loadReport() {
+  const r = await fetch('/api/report');
+  const j = await r.json();
+  const list = j.tasks || [];
+  document.getElementById('report-count').textContent = list.length + ' task';
+  document.getElementById('report-list').innerHTML = list.map(t => {
+    const smoke = t.smoke_ok === 1 ? 'OK' : t.smoke_ok === 0 ? 'GAGAL' : 'dilewati';
+    const smokeColor = t.smoke_ok === 1 ? 'var(--acc)' : t.smoke_ok === 0 ? 'var(--err)' : 'var(--dim)';
+    return `<div class="col" style="min-height:auto;margin-bottom:10px;padding:8px">
+      <div style="display:flex;justify-content:space-between;gap:8px;margin-bottom:6px">
+        <b style="font-size:9px">#${t.id} ${esc(t.title)}</b>
+        <span style="font-size:7px;color:var(--dim)">${fmt(t.ended)}</span>
+      </div>
+      <div class="dl-meta" style="font-size:8px">
+        <span>lokasi</span><b>${esc((t.root || '?').split(/[\\/]/).pop())}/${esc(t.folder)}</b>
+        <span>model</span><b>${esc(t.model)}</b>
+        <span>branch tujuan</span><b>${esc(t.merged_branch || '-')}</b>
+        <span>commit</span><b>${esc(t.commit_hash || '-')}</b>
+        <span>push</span><b>${t.pushed ? 'sudah di-push' : 'belum'}</b>
+        <span>smoke test</span><b style="color:${smokeColor}">${smoke}${t.smoke_note ? ' — ' + esc(t.smoke_note) : ''}</b>
+        <span>mulai</span><b>${esc(t.start_date || '-')}</b>
+      </div>
+      <details style="margin-top:6px"><summary style="font-size:7px;color:var(--dim);cursor:pointer">diff</summary>
+        <pre class="log" style="max-height:16vh">${esc(t.diff || '(tidak ada perubahan file)')}</pre></details>
+      <details><summary style="font-size:7px;color:var(--dim);cursor:pointer">log lengkap</summary>
+        <pre class="log" style="max-height:40vh">${esc(t.output || '(kosong)')}</pre></details>
+    </div>`;
+  }).join('') || '<div class="empty">belum ada task yang selesai merge</div>';
 }
 
 const api = async (u, opt) => {
