@@ -44,7 +44,6 @@ try { db.exec('ALTER TABLE task ADD COLUMN smoke_ok INTEGER'); } catch {}
 try { db.exec('ALTER TABLE task ADD COLUMN smoke_note TEXT'); } catch {}
 try { db.exec('ALTER TABLE task ADD COLUMN archived INTEGER NOT NULL DEFAULT 0'); } catch {}
 try { db.exec('ALTER TABLE task ADD COLUMN commit_hash TEXT'); } catch {}
-try { db.exec('ALTER TABLE task ADD COLUMN prd TEXT'); } catch {}
 
 // Seed awal cuma kalau tabel kosong. Env ROOTS/WORK_ROOT dipakai sekali di sini.
 const seed = (table, vals) => {
@@ -59,8 +58,8 @@ seed('model', ['9router/deepsek', '9router/combo-command', '9router/opencode']);
 const q = {
   all: () => db.prepare('SELECT * FROM task ORDER BY id').all(),
   get: id => db.prepare('SELECT * FROM task WHERE id = ?').get(id),
-  insert: t => db.prepare(`INSERT INTO task (title,root,folder,prompt,model,agent,status,created,start_date,prd)
-    VALUES (?,?,?,?,?,?,'todo',?,?,?)`).run(t.title, t.root, t.folder, t.prompt, t.model, t.agent, new Date().toISOString(), t.start_date || null, t.prd || null).lastInsertRowid,
+  insert: t => db.prepare(`INSERT INTO task (title,root,folder,prompt,model,agent,status,created,start_date)
+    VALUES (?,?,?,?,?,?,'todo',?,?)`).run(t.title, t.root, t.folder, t.prompt, t.model, t.agent, new Date().toISOString(), t.start_date || null).lastInsertRowid,
   upd: (id, patch) => {
     const keys = Object.keys(patch);
     if (!keys.length) return;
@@ -255,18 +254,11 @@ function runTask(t) {
       running.delete(t.id); return;
     }
     const args = ['run', '--model', t.model, '--title', `kanban-${t.id}: ${t.title}`, '--auto', '--format', 'json'];
-    if (t.prd) {
-      // PRD ditulis ke repo sebelum agent jalan; instruksi read selalu didahulukan.
-      let prdFile;
-      try {
-        prdFile = path.join(dir, `PRD-${t.id}.md`);
-        fs.writeFileSync(prdFile, t.prd);
-      } catch (e) {
-        q.upd(t.id, { status: 'error', output: 'pre-run: gagal tulis PRD: ' + e.message, ended: new Date().toISOString() });
-        running.delete(t.id); return;
-      }
-      args.push(`WAJIB: baca dulu file ${path.basename(prdFile)} di root kerja dan ikuti isinya sebagai spesifikasi utama. Jangan mulai kerja sebelum membaca file itu.\n\n${t.prompt}`);
-    } else args.push(t.prompt);
+    if (!fs.existsSync(path.join(dir, 'PRD.md'))) {
+      q.upd(t.id, { status: 'error', output: 'pre-run: folder belum punya PRD.md — isi PRD lewat dialog + FOLDER (ketik ulang nama folder yang sama)', ended: new Date().toISOString() });
+      running.delete(t.id); return;
+    }
+    args.push(`WAJIB: baca dulu file PRD.md di root kerja dan ikuti isinya sebagai spesifikasi utama. Jangan mulai kerja sebelum membaca file itu.\n\n${t.prompt}`);
 
     // stdio ke FILE, bukan pipe: opencode.exe di Windows sering tidak menulis apa pun ke pipe
     // (terbukti: pipe 0 byte, file ratusan byte). Tail file untuk log live.
@@ -404,13 +396,55 @@ http.createServer(async (req, res) => {
     const real = fs.realpathSync(abs);
     if (!real.startsWith(r.real + path.sep)) return json(res, 400, { error: 'folder di luar root' });
     if (!fs.statSync(real).isDirectory()) return json(res, 400, { error: 'bukan folder' });
+    // PRD folder: file tunggal, wajib ada sebelum task boleh run.
+    // Folder tanpa PRD.md -> 400, tapi folder kosong yang baru dibuat dibuang lagi
+    // biar tidak ada folder 0-byte yang terlanjur tercatat.
+    const hasPrd = fs.existsSync(path.join(real, 'PRD.md'));
+    if (!hasPrd) {
+      if (typeof b.prd === 'string' && b.prd.trim()) {
+        fs.writeFileSync(path.join(real, 'PRD.md'), b.prd.trim() + '\n');
+      } else {
+        if (fs.readdirSync(real).length === 0) fs.rmdirSync(real);
+        return json(res, 400, { error: 'prd wajib diisi (jadi PRD.md)' });
+      }
+    }
     return json(res, 200, { ok: true, path: real });
   }
   if (url.pathname === '/api/folders') {
     const r = findRoot(url.searchParams.get('root'));
     if (!r) return json(res, 400, { error: 'root tidak dikenal' });
     return json(res, 200, fs.readdirSync(r.path, { withFileTypes: true })
-      .filter(d => d.isDirectory() && !d.name.startsWith('.')).map(d => d.name));
+      .filter(d => d.isDirectory() && !d.name.startsWith('.')).map(d => ({
+        name: d.name,
+        hasPrd: fs.existsSync(path.join(r.path, d.name, 'PRD.md')),
+        hasGit: fs.existsSync(path.join(r.path, d.name, '.git')),
+      })));
+  }
+  // Isi PRD folder yang sudah ada (folder lama / belum punya PRD.md).
+  if (url.pathname === '/api/folders/prd') {
+    const root = url.searchParams.get('root'), folder = url.searchParams.get('folder');
+    let abs;
+    try { abs = safeDir(root, folder); } catch (e) { return json(res, 400, { error: e.message }); }
+    if (req.method === 'GET') {
+      try { return json(res, 200, { prd: fs.readFileSync(path.join(abs, 'PRD.md'), 'utf8') }); }
+      catch { return json(res, 200, { prd: '' }); }
+    }
+    const b = await body(req);
+    if (!String(b.prd || '').trim()) return json(res, 400, { error: 'prd wajib diisi' });
+    fs.writeFileSync(path.join(abs, 'PRD.md'), String(b.prd).trim() + '\n');
+    return json(res, 200, { ok: true });
+  }
+  // Hapus folder, hanya kalau belum jadi repo (tanpa .git) dan tidak dipakai task.
+  if (url.pathname === '/api/folders' && req.method === 'DELETE') {
+    const b = await body(req);
+    const r = findRoot(b.root);
+    if (!r) return json(res, 400, { error: 'root tidak dikenal' });
+    let abs;
+    try { abs = safeDir(b.root, b.folder); } catch (e) { return json(res, 400, { error: e.message }); }
+    if (fs.existsSync(path.join(abs, '.git'))) return json(res, 409, { error: 'folder sudah jadi repo, tidak dihapus' });
+    if (q.all().some(t => t.root === r.path && t.folder === b.folder && !t.archived)) return json(res, 409, { error: 'masih ada task di folder ini' });
+    fs.rmSync(abs, { recursive: true, force: true });
+    return json(res, 200, { ok: true });
   }
 
   // --- master root & model ---
@@ -518,11 +552,11 @@ http.createServer(async (req, res) => {
   }
   if (url.pathname === '/api/tasks' && req.method === 'POST') {
     const b = await body(req);
-    if (!b.title || !b.folder || !b.prompt || !b.root || !String(b.prd || '').trim()) return json(res, 400, { error: 'root/folder/title/prompt/prd wajib' });
+    if (!b.title || !b.folder || !b.prompt || !b.root) return json(res, 400, { error: 'root/folder/title/prompt wajib' });
     try { safeDir(b.root, b.folder); } catch (e) { return json(res, 400, { error: e.message }); }
     const models = modelNames();
     const id = q.insert({
-      title: b.title, root: b.root, folder: b.folder, prompt: b.prompt, prd: String(b.prd).trim(),
+      title: b.title, root: b.root, folder: b.folder, prompt: b.prompt,
       model: models.includes(b.model) ? b.model : models[0],
       agent: b.agent || null, start_date: b.start_date || null,
     });
@@ -538,7 +572,6 @@ http.createServer(async (req, res) => {
     }
     if (typeof b.title === 'string') patch.title = b.title;
     if (typeof b.prompt === 'string') patch.prompt = b.prompt;
-    if (typeof b.prd === 'string') patch.prd = b.prd;
     if (modelNames().includes(b.model)) patch.model = b.model;
     if (b.agent !== undefined) patch.agent = b.agent || null;
     q.upd(+m[1], patch);

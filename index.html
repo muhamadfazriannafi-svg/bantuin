@@ -109,13 +109,17 @@
 <dialog id="folder-dlg">
   <h2 style="font-size:10px;margin:0 0 10px">FOLDER BARU</h2>
   <label>root (proyek)</label>
-  <select id="nf_root"></select>
+  <select id="nf_root" onchange="refreshFolderList()"></select>
   <label>nama folder</label>
   <input id="nf_name" placeholder="bantuin">
   <label>repo github (opsional)</label>
   <input id="nf_repo" placeholder="kosongkan kalau tidak perlu">
   <label>visibilitas</label>
   <select id="nf_vis"><option value="private">PRIVATE</option><option value="public">PUBLIC</option></select>
+  <label>prd (wajib, jadi PRD.md — dipakai semua task di folder ini)</label>
+  <textarea id="nf_prd" style="height:140px" placeholder="# Tujuan&#10;## Kebutuhan&#10;- ...&#10;## Kriteria selesai&#10;- ..."></textarea>
+  <label>folder di root ini</label>
+  <div id="nf-list" style="border:2px solid var(--edge2);padding:6px;max-height:16vh;overflow:auto"></div>
   <div style="display:flex;gap:8px;margin-top:12px">
     <button class="btn go" id="btn-nf" onclick="createFolder()">BUAT FOLDER</button>
     <button class="btn" onclick="document.getElementById('folder-dlg').close()">BATAL</button>
@@ -152,8 +156,6 @@
   </div>
   <label>prompt</label>
   <textarea id="d-prompt-edit" style="height:90px"></textarea>
-  <label>prd (ditulis ke PRD-&lt;id&gt;.md saat run)</label>
-  <textarea id="d-prd-edit" style="height:120px"></textarea>
   <div style="display:flex;gap:8px;margin-bottom:8px">
     <button class="btn go" onclick="saveTask()">SIMPAN PERUBAHAN</button>
     <button class="btn" onclick="resetTask(taskId)">ULANG (HAPUS BRANCH)</button>
@@ -193,8 +195,6 @@
   <input id="f_start" type="date">
   <label>prompt ke agent</label>
   <textarea id="f_prompt" placeholder="jelaskan yang harus dikerjakan..."></textarea>
-  <label>prd (wajib, disimpan jadi PRD-&lt;id&gt;.md di repo)</label>
-  <textarea id="f_prd" placeholder="# Tujuan&#10;## Kebutuhan&#10;- ...&#10;## Kriteria selesai&#10;- ..."></textarea>
   <label>model</label>
   <select id="f_model"></select>
   <label>agent</label>
@@ -314,11 +314,10 @@ async function doMerge() {
 
 async function saveTask() {
   const prompt = document.getElementById('d-prompt-edit').value;
-  const prd = document.getElementById('d-prd-edit').value;
   if (!prompt.trim()) return alert('prompt tidak boleh kosong');
   const r = await fetch('/api/tasks/' + taskId, {
     method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ prompt, prd }),
+    body: JSON.stringify({ prompt }),
   });
   const j = await r.json();
   if (!r.ok) return alert('gagal: ' + j.error);
@@ -372,7 +371,7 @@ async function openNew() {
   document.getElementById('f_root').innerHTML = roots.map(r => `<option>${esc(r)}</option>`).join('');
   await loadFolders();
   document.getElementById('f_model').innerHTML = S.models.map(m => `<option>${esc(m)}</option>`).join('');
-  document.getElementById('f_title').value = ''; document.getElementById('f_prompt').value = ''; document.getElementById('f_prd').value = '';
+  document.getElementById('f_title').value = ''; document.getElementById('f_prompt').value = '';
   document.getElementById('f_start').value = new Date().toISOString().slice(0, 10);
   dlg.showModal();
 }
@@ -380,16 +379,58 @@ async function loadFolders() {
   const root = document.getElementById('f_root').value;
   const folders = await (await fetch('/api/folders?root=' + encodeURIComponent(root))).json();
   const list = Array.isArray(folders) ? folders : [];
-  document.getElementById('f_folder').innerHTML = list.map(f => `<option>${esc(f)}</option>`).join('')
+  document.getElementById('f_folder').innerHTML = list.map(f => `<option value="${esc(f.name)}">${esc(f.name)}${f.hasPrd ? '' : ' — belum ada PRD'}</option>`).join('')
     || '<option value="">(belum ada folder — pakai + FOLDER)</option>';
+  S.folders = list;
   checkRepo();
 }
 
-async function ensureFolder(root, folder) {
+// Hapus folder yang belum jadi repo; tombol ada di dialog + FOLDER.
+function renderFolderList(root) {
+  const list = (S.folders || []).filter(f => f.name);
+  document.getElementById('nf-list').innerHTML = list.map(f =>
+    `<div style="display:flex;gap:6px;align-items:center;margin-bottom:4px">
+      <span style="flex:1;font-size:8px">${esc(f.name)}${f.hasPrd ? '' : ' <i style="color:var(--warn)">(no PRD)</i>'}</span>
+      ${f.hasGit ? '<span style="font-size:8px;color:var(--dim)">repo</span>' : ''}
+      <button class="btn" style="font-size:8px" onclick="editFolderPrd('${esc(root)}','${esc(f.name)}')">EDIT PRD</button>
+      ${f.hasGit ? ''
+        : `<button class="btn del" style="font-size:8px" onclick="delFolder('${esc(root)}','${esc(f.name)}')">HAPUS</button>`}
+    </div>`).join('') || '<span style="font-size:8px;color:var(--dim)">(kosong)</span>';
+}
+
+async function delFolder(root, folder) {
+  if (!confirm(`hapus folder ${folder}?`)) return;
+  const r = await fetch('/api/folders', {
+    method: 'DELETE', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ root, folder }),
+  });
+  if (!r.ok) return alert((await r.json()).error);
+  await refreshFolderList();
+}
+
+// Edit PRD folder lama: pakai textarea PRD di dialog + FOLDER.
+async function editFolderPrd(root, folder) {
+  const el = document.getElementById('nf_prd');
+  const res = await (await fetch(`/api/folders/prd?root=${encodeURIComponent(root)}&folder=${encodeURIComponent(folder)}`)).json();
+  el.value = res.prd || '';
+  S.editing = { root, folder };
+  document.getElementById('nf_name').value = folder;
+  document.getElementById('btn-nf').textContent = 'SIMPAN PRD';
+  el.focus();
+}
+
+async function refreshFolderList() {
+  const root = document.getElementById('nf_root').value;
+  const res = await (await fetch('/api/folders?root=' + encodeURIComponent(root))).json();
+  S.folders = Array.isArray(res) ? res : [];
+  renderFolderList(root);
+}
+
+async function ensureFolder(root, folder, prd) {
   // POST /api/folders idempoten: aman dipanggil walau folder sudah ada
   const r = await fetch('/api/folders', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ root, folder }),
+    body: JSON.stringify({ root, folder, prd }),
   });
   if (!r.ok) throw new Error((await r.json()).error || 'gagal buat folder');
 }
@@ -437,11 +478,10 @@ async function createRepo() {
 async function create() {
   const b = {
     root: f_root.value, folder: f_folder.value, title: f_title.value.trim(), prompt: f_prompt.value.trim(),
-    prd: f_prd.value.trim(),
     model: f_model.value, agent: f_agent.value || null, start_date: f_start.value || null,
   };
-  if (!b.title || !b.prompt || !b.root || !b.folder) return alert('root, folder, judul & prompt wajib');
-  if (!b.prd) return alert('prd wajib diisi');
+  const miss = [!b.root && 'root', !b.folder && 'folder', !b.title && 'judul', !b.prompt && 'prompt'].filter(Boolean);
+  if (miss.length) return alert('kosong: ' + miss.join(', '));
   const r = await fetch('/api/tasks', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(b) });
   if (!r.ok) return alert((await r.json()).error);
   dlg.close(); load();
@@ -452,6 +492,10 @@ function openFolder() {
   document.getElementById('nf_root').innerHTML = (S.roots || []).map(r => `<option>${esc(r)}</option>`).join('');
   document.getElementById('nf_name').value = '';
   document.getElementById('nf_repo').value = '';
+  document.getElementById('nf_prd').value = '';
+  S.editing = null;
+  document.getElementById('btn-nf').textContent = 'BUAT FOLDER';
+  refreshFolderList().catch(() => {});
   document.getElementById('folder-dlg').showModal();
 }
 
@@ -460,12 +504,26 @@ async function createFolder() {
   const folder = document.getElementById('nf_name').value.trim();
   const repo = document.getElementById('nf_repo').value.trim();
   const visibility = document.getElementById('nf_vis').value;
+  const prd = document.getElementById('nf_prd').value.trim();
   if (!root) return alert('root wajib');
   if (!/^[\w.-]+$/.test(folder) || folder === '.' || folder === '..') return alert('nama folder tidak valid');
+  if (!prd) return alert('prd wajib diisi');
   const btn = document.getElementById('btn-nf');
   btn.disabled = true; btn.textContent = 'PROSES...';
   try {
-    await ensureFolder(root, folder);
+    if (S.editing && S.editing.root === root && S.editing.folder === folder && !repo) {
+      // mode edit PRD: cukup tulis PRD.md, jangan sentuh repo
+      const r = await fetch('/api/folders/prd', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ root, folder, prd }),
+      });
+      if (!r.ok) throw new Error((await r.json()).error || 'gagal simpan PRD');
+      document.getElementById('folder-dlg').close();
+      alert(`PRD ${folder} disimpan`);
+      loadFolders().catch(() => {});
+      return;
+    }
+    await ensureFolder(root, folder, prd);
     let note = `folder ${folder} dibuat`;
     if (repo) {
       const r = await fetch('/api/repo', {
@@ -478,10 +536,11 @@ async function createFolder() {
     }
     document.getElementById('folder-dlg').close();
     alert(note);
+    loadFolders().catch(() => {});
   } catch (e) {
     alert('gagal: ' + e.message);
   } finally {
-    btn.disabled = false; btn.textContent = 'BUAT FOLDER';
+    btn.disabled = false; btn.textContent = S.editing ? 'SIMPAN PRD' : 'BUAT FOLDER';
   }
 }
 
@@ -618,7 +677,6 @@ function detail(id) {
   document.getElementById('d-started').textContent = fmt(t.started);  document.getElementById('d-ended').textContent = fmt(t.ended);
   document.getElementById('d-prompt').textContent = t.prompt || '(kosong)';
   document.getElementById('d-prompt-edit').value = t.prompt || '';
-  document.getElementById('d-prd-edit').value = t.prd || '';
   document.getElementById('d-diff').textContent = t.diff || '(tidak ada perubahan file)';
   const log = document.getElementById('d-log');
   log.textContent = t.output || (t.status === 'doing' ? 'masih berjalan...' : '(output kosong)');
