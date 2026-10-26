@@ -44,6 +44,7 @@ try { db.exec('ALTER TABLE task ADD COLUMN smoke_ok INTEGER'); } catch {}
 try { db.exec('ALTER TABLE task ADD COLUMN smoke_note TEXT'); } catch {}
 try { db.exec('ALTER TABLE task ADD COLUMN archived INTEGER NOT NULL DEFAULT 0'); } catch {}
 try { db.exec('ALTER TABLE task ADD COLUMN commit_hash TEXT'); } catch {}
+try { db.exec('ALTER TABLE task ADD COLUMN prd TEXT'); } catch {}
 
 // Seed awal cuma kalau tabel kosong. Env ROOTS/WORK_ROOT dipakai sekali di sini.
 const seed = (table, vals) => {
@@ -58,8 +59,8 @@ seed('model', ['9router/deepsek', '9router/combo-command', '9router/opencode']);
 const q = {
   all: () => db.prepare('SELECT * FROM task ORDER BY id').all(),
   get: id => db.prepare('SELECT * FROM task WHERE id = ?').get(id),
-  insert: t => db.prepare(`INSERT INTO task (title,root,folder,prompt,model,agent,status,created,start_date)
-    VALUES (?,?,?,?,?,?,'todo',?,?)`).run(t.title, t.root, t.folder, t.prompt, t.model, t.agent, new Date().toISOString(), t.start_date || null).lastInsertRowid,
+  insert: t => db.prepare(`INSERT INTO task (title,root,folder,prompt,model,agent,status,created,start_date,prd)
+    VALUES (?,?,?,?,?,?,'todo',?,?,?)`).run(t.title, t.root, t.folder, t.prompt, t.model, t.agent, new Date().toISOString(), t.start_date || null, t.prd || null).lastInsertRowid,
   upd: (id, patch) => {
     const keys = Object.keys(patch);
     if (!keys.length) return;
@@ -254,7 +255,19 @@ function runTask(t) {
       running.delete(t.id); return;
     }
     const args = ['run', '--model', t.model, '--title', `kanban-${t.id}: ${t.title}`, '--auto', '--format', 'json'];
-    args.push(t.prompt);
+    if (t.prd) {
+      // PRD ditulis ke repo sebelum agent jalan; instruksi read selalu didahulukan.
+      let prdFile;
+      try {
+        prdFile = path.join(dir, `PRD-${t.id}.md`);
+        fs.writeFileSync(prdFile, t.prd);
+      } catch (e) {
+        q.upd(t.id, { status: 'error', output: 'pre-run: gagal tulis PRD: ' + e.message, ended: new Date().toISOString() });
+        running.delete(t.id); return;
+      }
+      args.push(`WAJIB: baca dulu file ${path.basename(prdFile)} di root kerja dan ikuti isinya sebagai spesifikasi utama. Jangan mulai kerja sebelum membaca file itu.\n\n${t.prompt}`);
+    } else args.push(t.prompt);
+
     // stdio ke FILE, bukan pipe: opencode.exe di Windows sering tidak menulis apa pun ke pipe
     // (terbukti: pipe 0 byte, file ratusan byte). Tail file untuk log live.
     const logPath = path.join(os.tmpdir(), `kanban-${t.id}-${Date.now()}.jsonl`);
@@ -505,11 +518,11 @@ http.createServer(async (req, res) => {
   }
   if (url.pathname === '/api/tasks' && req.method === 'POST') {
     const b = await body(req);
-    if (!b.title || !b.folder || !b.prompt || !b.root) return json(res, 400, { error: 'root/folder/title/prompt wajib' });
+    if (!b.title || !b.folder || !b.prompt || !b.root || !String(b.prd || '').trim()) return json(res, 400, { error: 'root/folder/title/prompt/prd wajib' });
     try { safeDir(b.root, b.folder); } catch (e) { return json(res, 400, { error: e.message }); }
     const models = modelNames();
     const id = q.insert({
-      title: b.title, root: b.root, folder: b.folder, prompt: b.prompt,
+      title: b.title, root: b.root, folder: b.folder, prompt: b.prompt, prd: String(b.prd).trim(),
       model: models.includes(b.model) ? b.model : models[0],
       agent: b.agent || null, start_date: b.start_date || null,
     });
@@ -525,6 +538,7 @@ http.createServer(async (req, res) => {
     }
     if (typeof b.title === 'string') patch.title = b.title;
     if (typeof b.prompt === 'string') patch.prompt = b.prompt;
+    if (typeof b.prd === 'string') patch.prd = b.prd;
     if (modelNames().includes(b.model)) patch.model = b.model;
     if (b.agent !== undefined) patch.agent = b.agent || null;
     q.upd(+m[1], patch);

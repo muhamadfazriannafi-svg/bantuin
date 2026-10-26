@@ -152,6 +152,8 @@
   </div>
   <label>prompt</label>
   <textarea id="d-prompt-edit" style="height:90px"></textarea>
+  <label>prd (ditulis ke PRD-&lt;id&gt;.md saat run)</label>
+  <textarea id="d-prd-edit" style="height:120px"></textarea>
   <div style="display:flex;gap:8px;margin-bottom:8px">
     <button class="btn go" onclick="saveTask()">SIMPAN PERUBAHAN</button>
     <button class="btn" onclick="resetTask(taskId)">ULANG (HAPUS BRANCH)</button>
@@ -191,6 +193,8 @@
   <input id="f_start" type="date">
   <label>prompt ke agent</label>
   <textarea id="f_prompt" placeholder="jelaskan yang harus dikerjakan..."></textarea>
+  <label>prd (wajib, disimpan jadi PRD-&lt;id&gt;.md di repo)</label>
+  <textarea id="f_prd" placeholder="# Tujuan&#10;## Kebutuhan&#10;- ...&#10;## Kriteria selesai&#10;- ..."></textarea>
   <label>model</label>
   <select id="f_model"></select>
   <label>agent</label>
@@ -310,10 +314,11 @@ async function doMerge() {
 
 async function saveTask() {
   const prompt = document.getElementById('d-prompt-edit').value;
+  const prd = document.getElementById('d-prd-edit').value;
   if (!prompt.trim()) return alert('prompt tidak boleh kosong');
   const r = await fetch('/api/tasks/' + taskId, {
     method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ prompt }),
+    body: JSON.stringify({ prompt, prd }),
   });
   const j = await r.json();
   if (!r.ok) return alert('gagal: ' + j.error);
@@ -367,7 +372,7 @@ async function openNew() {
   document.getElementById('f_root').innerHTML = roots.map(r => `<option>${esc(r)}</option>`).join('');
   await loadFolders();
   document.getElementById('f_model').innerHTML = S.models.map(m => `<option>${esc(m)}</option>`).join('');
-  document.getElementById('f_title').value = ''; document.getElementById('f_prompt').value = '';
+  document.getElementById('f_title').value = ''; document.getElementById('f_prompt').value = ''; document.getElementById('f_prd').value = '';
   document.getElementById('f_start').value = new Date().toISOString().slice(0, 10);
   dlg.showModal();
 }
@@ -432,9 +437,11 @@ async function createRepo() {
 async function create() {
   const b = {
     root: f_root.value, folder: f_folder.value, title: f_title.value.trim(), prompt: f_prompt.value.trim(),
+    prd: f_prd.value.trim(),
     model: f_model.value, agent: f_agent.value || null, start_date: f_start.value || null,
   };
   if (!b.title || !b.prompt || !b.root || !b.folder) return alert('root, folder, judul & prompt wajib');
+  if (!b.prd) return alert('prd wajib diisi');
   const r = await fetch('/api/tasks', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(b) });
   if (!r.ok) return alert((await r.json()).error);
   dlg.close(); load();
@@ -611,6 +618,7 @@ function detail(id) {
   document.getElementById('d-started').textContent = fmt(t.started);  document.getElementById('d-ended').textContent = fmt(t.ended);
   document.getElementById('d-prompt').textContent = t.prompt || '(kosong)';
   document.getElementById('d-prompt-edit').value = t.prompt || '';
+  document.getElementById('d-prd-edit').value = t.prd || '';
   document.getElementById('d-diff').textContent = t.diff || '(tidak ada perubahan file)';
   const log = document.getElementById('d-log');
   log.textContent = t.output || (t.status === 'doing' ? 'masih berjalan...' : '(output kosong)');
