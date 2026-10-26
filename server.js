@@ -258,14 +258,17 @@ function runTask(t) {
       q.upd(t.id, { status: 'error', output: 'pre-run: folder belum punya PRD.md — isi PRD lewat dialog + FOLDER (ketik ulang nama folder yang sama)', ended: new Date().toISOString() });
       running.delete(t.id); return;
     }
-    args.push(`WAJIB: baca dulu file PRD.md di root kerja dan ikuti isinya sebagai spesifikasi utama. Jangan mulai kerja sebelum membaca file itu.\n\n${t.prompt}`);
+    // opencode CLI kadang mengabaikan cwd proses (pakai workspace terakhir). Pagar eksplisit:
+    args.push(`LOKASI KERJA: ${dir}\n`
+      + `Semua file yang dibaca/diubah WAJIB di dalam folder itu. Jangan menyentuh folder lain (bukan ${__dirname}, bukan root ${t.root}).\n`
+      + `WAJIB: baca dulu ${path.join(dir, 'PRD.md')} dan ikuti isinya sebagai spesifikasi utama. Jangan mulai kerja sebelum membacanya.\n\n${t.prompt}`);
 
     // stdio ke FILE, bukan pipe: opencode.exe di Windows sering tidak menulis apa pun ke pipe
     // (terbukti: pipe 0 byte, file ratusan byte). Tail file untuk log live.
     const logPath = path.join(os.tmpdir(), `kanban-${t.id}-${Date.now()}.jsonl`);
     const fd = fs.openSync(logPath, 'w');
     const child = spawn(AGENT, args, {
-      cwd: dir, env: process.env, shell: AGENT_SHELL, windowsHide: true,
+      cwd: dir, env: { ...process.env, PWD: dir, INIT_CWD: dir, OLDPWD: dir }, shell: AGENT_SHELL, windowsHide: true,
       stdio: ['ignore', fd, fd],
     });
     fs.closeSync(fd);                   // anak sudah memegang handle sendiri
